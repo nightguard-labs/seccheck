@@ -361,6 +361,35 @@ def s_loader(code_dir):
     rec("sec: untrusted files are not loaded with a code-running loader", not m, m.group(0) if m else "")
 
 
+HARMLESS = {"html": "hello", "redirect": "/home", "code": "1+1", "env": "hello", "shell": "hello", "redos": "hello"}
+
+
+def control_broken(a, code_dir):
+    """11/23 v1.1: run the plan once with a HARMLESS value. If even that crashes with a Python traceback, the plan's
+    command is wrong (bad file format, wrong arguments), so a 'no attack got through' result would prove nothing."""
+    try: rc, so, se, _, _, _ = attempt(a, code_dir, HARMLESS[a["kind"]])
+    except SetupFailed as e: return f"setup failed: {e}"
+    if rc not in (0, "timeout") and "Traceback (most recent call last)" in se:
+        return (se.strip().splitlines() or ["?"])[-1][:100]
+    return None
+
+
+_ATOM = r"(?:\\.|\[(?:\\.|[^\]\\])*\]|[^()\\\[\]|?*+{}])"
+_Q = r"(?:[+*]|\{\d+,\d*\})"
+# 11/23: dangerous = a group whose ONLY required part repeats (everything else optional), and the group repeats: (a+)+ ([a-z]+\s?)+
+NESTED = re.compile(r"\((?:%s[?*])*%s%s(?:%s[?*])*\)%s" % (_ATOM, _ATOM, _Q, _ATOM, _Q))
+
+
+def s_redos(code_dir):
+    """11/23 v1.1: static ReDoS scan (runs every time, like the secret scan): a regex with a repeated group that itself
+    repeats, like ^([a-z]+\\s?)+$, can take exponential time on a long hostile input."""
+    hits = []
+    for f, txt in source(code_dir).items():
+        for lit in re.findall(r"""re\.(?:compile|match|search|fullmatch|findall|finditer|sub|split)\(\s*[rbuRBU]*(['"])(.*?)\1""", txt):
+            if NESTED.search(lit[1]): hits.append(f"{f}: {lit[1][:40]}")
+    rec("sec: no regex with nested repetition (ReDoS risk)", not hits, "; ".join(hits))
+
+
 KINDS = {"path": k_path, "shell": k_shell, "sql": k_sql, "leak": k_leak, "deserialize": k_deserialize, "zip": k_zip,
          "redos": k_redos, "html": k_html, "redirect": k_redirect, "archive": k_zip, "tar": k_zip,
          "code": k_code, "eval": k_code, "env": k_env}
@@ -392,6 +421,7 @@ if __name__ == "__main__":
     attacks = plan.get("attacks", []) if isinstance(plan, dict) else []
     kinds = {a.get("kind") for a in attacks if isinstance(a, dict)}
     s_secrets(code_dir)
+    s_redos(code_dir)
     if "token" in kinds: s_token(code_dir)
     if "deserialize" in kinds: s_loader(code_dir)
     NEED = {"path": "PAYLOAD", "shell": "PAYLOAD", "sql": "PAYLOAD", "redos": "PAYLOAD", "leak": "CANARY", "redirect": "PAYLOAD",
@@ -408,6 +438,9 @@ if __name__ == "__main__":
             INVALID.append("sql: no rows were stored first (setup)"); continue
         if a["kind"] != "deserialize" and not isinstance(a.get("cmd"), list) and a["kind"] != "token":
             INVALID.append(f"{a.get('kind')}: no cmd list"); continue
+        if a["kind"] in HARMLESS and isinstance(a.get("cmd"), list):
+            why = control_broken(a, code_dir)
+            if why: INVALID.append(f"{a['kind']}: the program crashes even on harmless input with this plan ({why})"); continue
         try: KINDS[a["kind"]](a, code_dir)
         except Exception as e: INVALID.append(f"{a['kind']}: library error {type(e).__name__}: {e}"[:200])
     print("SECLIB-RESULT " + json.dumps({"checks": RESULTS, "invalid": INVALID, "kinds": sorted(k for k in kinds if k)}))

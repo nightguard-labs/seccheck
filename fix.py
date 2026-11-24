@@ -99,7 +99,7 @@ def judge(r0, r1, base, after):
     if base is None or after is None: why.append("still-works check could not run")
     else:   # compare only inputs where the ORIGINAL worked; a fix may handle errors better (crash -> clear message)
         if len(base) != len(after): why.append("behavior changed: different number of results")
-        diffs = [f"{a[1]} input {a[2]!r}: printed {a[4][:60]!r}, now {b[3]}/{b[4][:60]!r}" for a, b in zip(base, after) if a[3] is True and a != b]
+        diffs = [f"{a[1]} input {a[2]!r}: printed {a[4][:60]!r}, now {b[3]}/{b[4][:60]!r}" for a, b in zip(base, after) if a[3] is True and a[:5] != b[:5]]
         if diffs: why.append("behavior changed: " + "; ".join(diffs[:3]))
     strength = sum(1 for row in (base or []) if row[1] == "usage" and row[3] is True and row[4].strip())
     return (not why), why, strength
@@ -112,6 +112,9 @@ def run(task_file, code_dir, model, r0, tries=2, log=print):
     up = usage_plan(model, task, code)
     check_plan = {"attacks": (r0["plan"].get("attacks", []) if isinstance(r0.get("plan"), dict) else []) + up["attacks"]}
     base = core.smoke(check_plan, code_dir)
+    base2 = core.smoke(check_plan, code_dir)   # 11/23: run twice; output that changes on its own (random tokens, times) is not compared
+    if base and base2 and len(base) == len(base2):
+        base = [row if row == row2 else row[:3] + ["varies", ""] for row, row2 in zip(base, base2)]
     feedback, result = "", {"status": "failed", "reasons": ["model wrote no usable fix"], "files": {}, "tries": 0}
     for t in range(1, tries + 1):
         log(f"fix: attempt {t}: asking {model} for a fix")

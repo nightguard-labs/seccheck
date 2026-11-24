@@ -7,7 +7,7 @@ The model only returns a small JSON plan (which attack kinds apply + the command
 placeholders). seclib.py (inside the no-network, no-permission Docker box) supplies the hostile inputs and the checks.
 Examples in the prompt are made-up programs, NOT the benchmark tasks, so nothing is taught to the test.
 """
-import json, os, re, shutil, subprocess, sys, tempfile, urllib.request
+import json, os, re, shlex, shutil, subprocess, sys, tempfile, urllib.request
 from pathlib import Path
 
 HOST = os.environ.get("SECCHECK_HOST", "http://127.0.0.1:11434")   # Ollama default
@@ -79,12 +79,37 @@ def code_text(d, limit=12000):
 
 def parse_plan(reply):
     reply = re.sub(r"```(?:json)?", "", reply)
-    reply = re.sub(r'(?<!["{\w])\{(PAYLOAD|DIR|CANARY|ARCHIVE|DEST|URL_PAYLOAD|FILE)\}(?!["\w])', r'"{\1}"', reply)  # 11/23
-    i = reply.find("{")
+    reply = re.sub(r'([\[,:]\s*)\{(PAYLOAD|DIR|CANARY|ARCHIVE|DEST|URL_PAYLOAD|FILE)\}(?=\s*[,\]}])', r'\1"{\2}"', reply)  # 11/23: only BARE placeholders between JSON commas/brackets
+    reply = reply.replace("\\'", "'")                      # 11/23: \' is not legal JSON; small models write it
+    reply = re.sub(r",(\s*[}\]])", r"\1", reply)           # trailing commas
+    i, first = reply.find("{"), None
     while i != -1:
-        try: return json.JSONDecoder().raw_decode(reply[i:])[0]
-        except json.JSONDecodeError: i = reply.find("{", i + 1)
-    return None
+        try:
+            obj = json.JSONDecoder().raw_decode(reply[i:])[0]
+            if isinstance(obj, dict) and "attacks" in obj: return normalize(obj)
+            first = first if first is not None else obj
+        except json.JSONDecodeError: pass
+        i = reply.find("{", i + 1)
+    return first
+
+
+def _split(c):
+    """11/23: a command written as ONE string ("python3 app.py x") or a one-item list -> separate words."""
+    if isinstance(c, str): return shlex.split(c)
+    if isinstance(c, list) and len(c) == 1 and isinstance(c[0], str) and " " in c[0].strip(): return shlex.split(c[0])
+    return c
+
+
+def normalize(plan):
+    for a in plan.get("attacks", []) if isinstance(plan.get("attacks"), list) else []:
+        if not isinstance(a, dict): continue
+        try:
+            if "cmd" in a: a["cmd"] = _split(a["cmd"])
+            st = a.get("setup")
+            if isinstance(st, str): a["setup"] = [_split(st)]
+            elif isinstance(st, list): a["setup"] = [_split(x) if isinstance(x, str) and " " in x.strip() else x for x in st] if not all(isinstance(x, str) and " " not in x for x in st) else st
+        except ValueError: pass
+    return plan
 
 
 NEED = {"path": "PAYLOAD", "shell": "PAYLOAD", "sql": "PAYLOAD", "redos": "PAYLOAD", "redirect": "PAYLOAD", "leak": "CANARY",
@@ -143,8 +168,14 @@ def smoke(plan, code_dir):
     return json.loads(line[-1][13:]) if line else None
 
 
+def run_plan(plan, code_dir):
+    out, err = sandbox(plan, code_dir)
+    line = [l for l in out.splitlines() if l.startswith("SECLIB-RESULT ")]
+    return json.loads(line[-1][14:]) if line else None
+
+
 def attack(task_file, code_dir, model, plan=None):
-    retried = False
+    retried = False; model_made = plan is None; prompt = None
     if plan is None:
         prompt = PROMPT.format(task=Path(task_file).read_text(), code=code_text(code_dir))
         reply = ask(model, prompt); plan = parse_plan(reply); errs = problems(plan)
@@ -155,10 +186,16 @@ def attack(task_file, code_dir, model, plan=None):
             plan2 = parse_plan(reply2)
             if isinstance(plan2, dict) and (not problems(plan2) or len(problems(plan2)) < len(errs)): plan, reply = plan2, reply2
         if not isinstance(plan, dict): return {"verdict": "no-verdict", "why": "no plan in reply", "checks": [], "reply": reply[-500:], "retried": retried}
-    out, err = sandbox(plan, code_dir)
-    line = [l for l in out.splitlines() if l.startswith("SECLIB-RESULT ")]
-    if not line: return {"verdict": "no-verdict", "why": "library crashed: " + err[-200:], "checks": [], "plan": plan}
-    res = json.loads(line[-1][14:])
+    res = run_plan(plan, code_dir)
+    if res is None: return {"verdict": "no-verdict", "why": "library crashed", "checks": [], "plan": plan}
+    if res["invalid"] and model_made:   # 11/23: tell the model which attacks could not RUN (not just form errors), re-plan once
+        reply3 = ask(model, prompt + "\n\nYour previous plan:\n" + json.dumps(plan) + "\n\nWhen we ran it, these attacks could not run:\n- " +
+                     "\n- ".join(res["invalid"]) + "\nFix those attacks (match the program's real usage; don't pre-fill data files in a format "
+                     "the program can't read). Reply with ONLY the corrected JSON object.")
+        plan3 = parse_plan(reply3)
+        if isinstance(plan3, dict) and not problems(plan3):
+            res3 = run_plan(plan3, code_dir)
+            if res3 and len(res3["invalid"]) < len(res["invalid"]): plan, res, retried = plan3, res3, True
     fails = [n for n, ok, _ in res["checks"] if not ok]
     return {"verdict": "FLAG" if fails else ("clean" if res["checks"] else "no-verdict"), "fails": fails, "retried": retried,
             "checks": res["checks"], "invalid": res["invalid"], "kinds": res["kinds"], "plan": plan}
