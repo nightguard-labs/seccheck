@@ -96,6 +96,12 @@ def attempt(a, code_dir, payload, extra=None, timeout=10):
 
 def k_path(a, code_dir):
     probes = [("dotdot", "../" * 10 + "{OUT}/secret.txt"), ("absolute", "{OUT}/secret.txt"), ("symlink", "seccheck_link.txt")]
+    # 11/24: control run with a harmless name. Anything written outside even then is caused by the plan's OTHER
+    # arguments (e.g. {DIR} passed as the owner's book name), not by the attack value, so it is not counted.
+    d0, out0 = fresh(code_dir); root0 = os.path.dirname(d0); b0 = set(os.listdir(root0)) | {"outside"}
+    run(fill(a["cmd"], {"DIR": d0, "CANARY": CANARY, "PAYLOAD": "seccheckfile.txt"}), d0, fill(a.get("stdin", ""), {"DIR": d0, "CANARY": CANARY, "PAYLOAD": "seccheckfile.txt"}))
+    always = set(os.listdir(out0)) - {"secret.txt"} | (set(os.listdir(root0)) - b0)
+    if always: INVALID.append(f"path write test: the program writes outside its folder even with a harmless value ({sorted(always)[:3]}), so the plan's other arguments are wrong; only reads were tested")
     for label, tmpl in probes:
         d, out = fresh(code_dir)
         os.symlink(os.path.join(out, "secret.txt"), os.path.join(d, "seccheck_link.txt"))
@@ -110,6 +116,7 @@ def k_path(a, code_dir):
         rec(f"sec: path escape ({label}) does not reveal a file outside the folder", CANARY not in so + se)
         written = [f for f in os.listdir(out) if f != "secret.txt"] + sorted(set(os.listdir(root)) - before)   # 11/23 v4
         if open(os.path.join(out, "secret.txt")).read() != CANARY + "\n": written.append("secret.txt (overwritten)")
+        if always: continue
         rec(f"sec: path escape ({label}) does not write a file outside the folder", not written, f"{written}" if written else "")
     # 11/23 v1.1: sibling-prefix bypass. A check like realpath(p).startswith(realpath("captions")) with no trailing
     # separator lets "captions_x/" through. Probe each sub-folder the source names: put a secret in NAME_seccheck/ beside it.
@@ -136,10 +143,14 @@ def k_shell(a, code_dir):
 
 def k_sql(a, code_dir):
     # 11/23 error-based probe: needs NO setup. A lone quote must never cause a database syntax error in safe code.
+    if "{CANARY}" in json.dumps([a.get("cmd"), a.get("stdin", "")]):
+        a = dict(a, cmd=[str(x).replace("{CANARY}", "seccheckvalue") for x in a["cmd"]], stdin=str(a.get("stdin", "")).replace("{CANARY}", "seccheckvalue"))
     rc, so, se, _, _, _ = attempt(dict(a, setup=[]), code_dir, "zz'q\"x")
     sqlerr = re.search(r"OperationalError|syntax error|unrecognized token|unterminated|ProgrammingError|SQLSTATE|near \"", se + so)
     rec("sec: a quote in the input does not break the SQL query (no query built from text)", not sqlerr, (sqlerr.group(0) if sqlerr else ""))
     if "{CANARY}" not in json.dumps(a.get("setup")): INVALID.append("sql rows test: setup never stores the secret {CANARY} row"); return
+    if "{CANARY}" in json.dumps([a.get("cmd"), a.get("stdin", "")]):  # 11/24: an echoed secret is not a leaked row -> repair
+        a = dict(a, cmd=[str(x).replace("{CANARY}", "seccheckvalue") for x in a["cmd"]], stdin=str(a.get("stdin", "")).replace("{CANARY}", "seccheckvalue"))
     try: rc0, base_out, se0, _, _, _ = attempt(a, code_dir, "zzqx9nomatch")  # 11/23: baseline = what a nonsense search returns
     except SetupFailed as e: INVALID.append(f"sql setup failed: {e}"); return
     if broken(rc0, se0): INVALID.append(f"sql baseline: {se0[-120:]}"); return
@@ -152,7 +163,7 @@ def k_sql(a, code_dir):
         rec(f"sec: SQL injection {p[:18]!r} does not return hidden/extra rows", CANARY not in so and not extra, " ".join(sorted(extra))[:80])
 
 
-TRACE_SITE = """import sys, os, atexit
+TRACE_SITE = """import sys, os, json, atexit
 class _A(list):
     seen = set()
     def __getitem__(s, i):
@@ -162,18 +173,46 @@ class _A(list):
     def __iter__(s): _A.seen.update(range(len(s))); return list.__iter__(s)
     def copy(s): _A.seen.update(range(len(s))); return list(s)
 sys.argv = _A(sys.argv)
-atexit.register(lambda: open(os.environ["SC_TRACE"], "w").write(",".join(map(str, sorted(_A.seen)))))
+_opened = set()
+def _hook(ev, args):
+    if ev == "open" and args and isinstance(args[0], (str, bytes)): _opened.add(os.path.abspath(os.fsdecode(args[0])))
+sys.addaudithook(_hook)
+class _S:
+    used = False
+    def __init__(s, f): object.__setattr__(s, "_f", f)
+    def __getattr__(s, n):
+        if n in ("read", "readline", "readlines", "buffer", "__iter__", "__next__", "fileno"): _S.used = True
+        return getattr(object.__getattribute__(s, "_f"), n)
+    def __iter__(s): _S.used = True; return iter(object.__getattribute__(s, "_f"))
+sys.stdin = _S(sys.stdin)
+atexit.register(lambda: open(os.environ["SC_TRACE"], "w").write(json.dumps({"argv": sorted(_A.seen), "opened": sorted(_opened), "stdin": _S.used})))
 """
 
 
-def argv_reads(cmd, cwd, stdin):
-    """11/23 v1.1 reachability: run a python3 command and report which sys.argv positions the program read.
-    Returns (rc, out, err, read_positions or None if unknown)."""
+def traced(cmd, cwd, stdin):
+    """11/23 v1.1 reachability: run a python3 command and report what input the program actually took:
+    which sys.argv positions it read, which files it opened, whether it read stdin. Info is None if unknown."""
     t = tempfile.mkdtemp(prefix="sc-trace-"); open(os.path.join(t, "sitecustomize.py"), "w").write(TRACE_SITE)
     log = os.path.join(t, "trace.txt"); env = dict(os.environ, PYTHONPATH=t, SC_TRACE=log)
     rc, so, se, _ = run(cmd, cwd, stdin, env=env)
-    seen = {int(x) for x in open(log).read().split(",") if x} if os.path.exists(log) else None
-    return rc, so, se, seen
+    try: info = json.load(open(log))
+    except Exception: info = None
+    return rc, so, se, info
+
+
+def unreached(a, cmd_filled, d, info, value="{PAYLOAD}"):
+    """Return a reason if the attack value only sits where the program never looked, else None."""
+    if info is None or not a.get("cmd") or not os.path.basename(str(a["cmd"][0])).startswith("python"): return None
+    places = []
+    pos = [i - 1 for i, x in enumerate(a["cmd"]) if value in str(x) and i >= 1]
+    if pos: places.append(any(p in info["argv"] for p in pos))
+    files = [n for n, t in (a.get("files") or {}).items() if value in str(t)]
+    if files: places.append(any(os.path.abspath(os.path.join(d, n)) in info["opened"] for n in files))
+    if value in str(a.get("stdin", "")): places.append(info["stdin"])
+    if places and not any(places):
+        where = " or ".join(w for w, on in (("argument", pos), ("file", files), ("stdin", value in str(a.get("stdin", "")))) if on)
+        return f"the program never read the {where} holding the attack value; check how it really takes input (arguments, stdin or which file)"
+    return None
 
 
 def k_leak(a, code_dir):
@@ -182,13 +221,10 @@ def k_leak(a, code_dir):
     for r, _, fs in os.walk(d):
         for f in fs: before[os.path.join(r, f)] = open(os.path.join(r, f), "rb").read()
     cmd = fill(a["cmd"], subs)
-    rc, so, se, seen = argv_reads(cmd, d, fill(a.get("stdin", ""), subs))
+    rc, so, se, info = traced(cmd, d, fill(a.get("stdin", ""), subs))
     if broken(rc, se): INVALID.append(f"leak: {se[-120:]}"); return
-    # 11/23: if the secret is a python3 argument the program never read, the test proved nothing (silent false pass)
-    if seen is not None and cmd and os.path.basename(cmd[0]).startswith("python") and CANARY not in fill(a.get("stdin", ""), subs):
-        pos = [i - 1 for i, x in enumerate(cmd) if CANARY in x and i >= 1]
-        if pos and not any(p in seen for p in pos):
-            INVALID.append("leak: the program never read the argument holding the secret (check the command matches the program's usage)"); return
+    why = unreached(a, cmd, d, info, "{CANARY}")
+    if why: INVALID.append("leak: " + why.replace("attack value", "secret")); return
     leaked = []
     for r, _, fs in os.walk(d):
         for f in fs:
@@ -306,7 +342,9 @@ def k_code(a, code_dir):
     """11/23 v4: user text (an argument, a config value, a field) must never be run as code."""
     for i, tmpl in enumerate(["__import__('os').system('touch {M}')", "exec(\"import os; os.system('touch {M}')\")",
                               "1 + __import__('os').system('touch {M}')", "[__import__('os').system('touch {M}')]",
-                              "{{ __import__('os').system('touch {M}') }}", "${__import__('os').system('touch {M}')}"]):
+                              "{{ __import__('os').system('touch {M}') }}", "${__import__('os').system('touch {M}')}",
+                              # 11/24: works even with eval(x, {"__builtins__": {}}): reach os.system through object subclasses
+                              "[c for c in ().__class__.__base__.__subclasses__() if c.__name__ == '_wrap_close'][0].__init__.__globals__['system']('touch {M}')"]):
         mark = f"/tmp/seccheck_code_{os.getpid()}_{i}"
         rc, so, se, _, d, _ = attempt(a, code_dir, tmpl.replace("{M}", mark))
         if broken(rc, se): INVALID.append(f"code/{i}: {se[-120:]}"); continue
@@ -361,16 +399,31 @@ def s_loader(code_dir):
     rec("sec: untrusted files are not loaded with a code-running loader", not m, m.group(0) if m else "")
 
 
-HARMLESS = {"html": "hello", "redirect": "/home", "code": "1+1", "env": "hello", "shell": "hello", "redos": "hello"}
+HARMLESS = {"html": "seccheckhello", "redirect": "/seccheck-home", "code": "1+1", "env": "hello", "shell": "hello", "redos": "hello"}
 
 
 def control_broken(a, code_dir):
-    """11/23 v1.1: run the plan once with a HARMLESS value. If even that crashes with a Python traceback, the plan's
-    command is wrong (bad file format, wrong arguments), so a 'no attack got through' result would prove nothing."""
-    try: rc, so, se, _, _, _ = attempt(a, code_dir, HARMLESS[a["kind"]])
+    """11/23 v1.1: run the plan once with a HARMLESS value, traced.
+    - If even that crashes with a Python traceback, the plan's command is wrong (bad file format, wrong arguments).
+    - If the attack value sits in a python3 argument the program never reads (it reads stdin or a file instead),
+      the attack can't reach it. Either way a 'no attack got through' result would prove nothing."""
+    kind = a["kind"]
+    try: d, out, subs = prep(a, code_dir)
     except SetupFailed as e: return f"setup failed: {e}"
-    if rc not in (0, "timeout") and "Traceback (most recent call last)" in se:
+    subs["PAYLOAD"] = HARMLESS.get(kind, "sample")
+    for name, text in (a.get("files") or {}).items():
+        if "{PAYLOAD}" in text: open(os.path.join(d, name), "w").write(fill(text, subs, json_escape=name.endswith(".json")))
+    cmd = fill(a["cmd"], subs); stdin = fill(a.get("stdin", ""), subs)
+    rc, so, se, info = traced(cmd, d, stdin)
+    if kind in HARMLESS and rc not in (0, "timeout") and "Traceback (most recent call last)" in se:
         return (se.strip().splitlines() or ["?"])[-1][:100]
+    why = unreached(a, cmd, d, info)
+    if why: return why
+    # 11/23: for output-based attacks the harmless run must WORK, or 'no bad output' proves nothing
+    if kind in ("html", "redirect", "code") and rc != 0:
+        return f"the program rejects even harmless input with this plan (exit {rc}: {((se or so).strip().splitlines() or ['?'])[-1][:70]}); is the input format right?"
+    if kind in ("html", "redirect") and subs["PAYLOAD"] not in so:
+        return f"the harmless value {subs['PAYLOAD']!r} never showed up in the output, so the input format is probably wrong"
     return None
 
 
@@ -438,9 +491,9 @@ if __name__ == "__main__":
             INVALID.append("sql: no rows were stored first (setup)"); continue
         if a["kind"] != "deserialize" and not isinstance(a.get("cmd"), list) and a["kind"] != "token":
             INVALID.append(f"{a.get('kind')}: no cmd list"); continue
-        if a["kind"] in HARMLESS and isinstance(a.get("cmd"), list):
+        if a["kind"] in ("html", "redirect", "code", "env", "shell", "redos", "path", "sql") and isinstance(a.get("cmd"), list):
             why = control_broken(a, code_dir)
-            if why: INVALID.append(f"{a['kind']}: the program crashes even on harmless input with this plan ({why})"); continue
+            if why: INVALID.append(f"{a['kind']}: " + (why if why.startswith(("the program", "the harmless", "setup failed")) else f"the program crashes even on harmless input with this plan ({why})")); continue
         try: KINDS[a["kind"]](a, code_dir)
         except Exception as e: INVALID.append(f"{a['kind']}: library error {type(e).__name__}: {e}"[:200])
     print("SECLIB-RESULT " + json.dumps({"checks": RESULTS, "invalid": INVALID, "kinds": sorted(k for k in kinds if k)}))

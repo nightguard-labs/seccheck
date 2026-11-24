@@ -107,7 +107,9 @@ def normalize(plan):
             if "cmd" in a: a["cmd"] = _split(a["cmd"])
             st = a.get("setup")
             if isinstance(st, str): a["setup"] = [_split(st)]
-            elif isinstance(st, list): a["setup"] = [_split(x) if isinstance(x, str) and " " in x.strip() else x for x in st] if not all(isinstance(x, str) and " " not in x for x in st) else st
+            elif isinstance(st, list):
+                if all(isinstance(x, str) and " " not in x.strip() for x in st): pass          # one command already split into words
+                else: a["setup"] = [_split(x) if isinstance(x, (str, list)) else x for x in st]  # 11/24: also [["python3 app.py add x"]]
         except ValueError: pass
     return plan
 
@@ -126,6 +128,8 @@ def problems(plan):
         k = a.get("kind"); body = json.dumps({x: a.get(x) for x in ("cmd", "stdin", "files")})
         if k in NEED and "{" + NEED[k] + "}" not in body and not (k == "leak" and "{PAYLOAD}" in body):
             out.append(f"the {k} attack never passes {{{NEED[k]}}} to the program; put the placeholder exactly where the untrusted value goes, don't write your own attack strings")
+        if k == "sql" and "{CANARY}" in json.dumps([a.get("cmd"), a.get("stdin")]):
+            out.append("in the sql attack, {CANARY} goes ONLY in setup (store it as a hidden row); the attack cmd uses {PAYLOAD} where a visitor's text goes")
         if k in NEED and not isinstance(a.get("cmd"), list): out.append(f"the {k} attack needs \"cmd\" as a list of strings")
         for bad in sorted(set(re.findall(r"\{([A-Z_]+)\}", json.dumps(a))) - {"DIR", "PAYLOAD", "CANARY", "ARCHIVE", "FILE", "OUT"}):
             out.append(f"{{{bad}}} is not a placeholder seccheck knows; use exactly {{{NEED.get(k, 'PAYLOAD')}}}")
@@ -174,6 +178,26 @@ def run_plan(plan, code_dir):
     return json.loads(line[-1][14:]) if line else None
 
 
+SECRET_WORDS = re.compile(r"passw|passcode|\bpin\b|secret|token|api[ _-]?key|private key|credential|card|ssn|social security|\bkey\b", re.I)
+
+
+def leak_out_of_scope(plan, task_file, code_dir):
+    """11/24: the leak test asks 'is a SECRET written to a file or log?'. If neither the task nor the code mentions
+    any secret (password, token, key, card...), saving the input is the program's job (an upload saver), not a leak.
+    Such leak attacks are removed from the plan and reported as skipped."""
+    try: task = open(task_file).read() if task_file else ""
+    except OSError: task = ""
+    try: import seclib; src = "\n".join(seclib.source(code_dir).values())
+    except Exception: src = ""
+    if not task_file or SECRET_WORDS.search(task) or SECRET_WORDS.search(src): return []
+    atk = plan.get("attacks") if isinstance(plan, dict) else None
+    if not isinstance(atk, list): return []
+    keep = [a for a in atk if not (isinstance(a, dict) and a.get("kind") == "leak")]
+    if len(keep) == len(atk): return []
+    plan["attacks"] = keep
+    return ["leak: neither the task nor the code handles a secret (password, token, key, card), so saving the input is the program's job, not a leak"]
+
+
 def attack(task_file, code_dir, model, plan=None):
     retried = False; model_made = plan is None; prompt = None
     if plan is None:
@@ -186,8 +210,10 @@ def attack(task_file, code_dir, model, plan=None):
             plan2 = parse_plan(reply2)
             if isinstance(plan2, dict) and (not problems(plan2) or len(problems(plan2)) < len(errs)): plan, reply = plan2, reply2
         if not isinstance(plan, dict): return {"verdict": "no-verdict", "why": "no plan in reply", "checks": [], "reply": reply[-500:], "retried": retried}
+    dropped = leak_out_of_scope(plan, task_file, code_dir)
     res = run_plan(plan, code_dir)
     if res is None: return {"verdict": "no-verdict", "why": "library crashed", "checks": [], "plan": plan}
+    res["invalid"] = dropped + res["invalid"]
     if res["invalid"] and model_made:   # 11/23: tell the model which attacks could not RUN (not just form errors), re-plan once
         reply3 = ask(model, prompt + "\n\nYour previous plan:\n" + json.dumps(plan) + "\n\nWhen we ran it, these attacks could not run:\n- " +
                      "\n- ".join(res["invalid"]) + "\nFix those attacks (match the program's real usage; don't pre-fill data files in a format "

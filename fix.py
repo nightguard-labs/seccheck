@@ -71,7 +71,8 @@ def usage_plan(model, task, code):
         if not isinstance(j, dict): continue
         ok = lambda c: isinstance(c, list) and c and all(isinstance(x, str) for x in c)
         setup = [c for c in (j.get("setup") or []) if ok(c)]
-        checks = [c for c in (j.get("checks") or []) if ok(c)]
+        prog = {Path(f).name for f in code.split("--- ")[1:] for f in [f.split(" ---")[0]]}
+        checks = [c for c in (j.get("checks") or []) if ok(c) and any(Path(x).name in prog for x in c)]   # 11/23: must RUN the program, not cat its log
         if checks: return {"attacks": [{"kind": "usage", "setup": setup, "cmd": c} for c in checks]}
     return {"attacks": []}
 
