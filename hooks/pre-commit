@@ -1,0 +1,7 @@
+#!/bin/sh
+# seccheck git pre-commit hook. Copy to .git/hooks/pre-commit (chmod +x).
+# Describe what your program does and where untrusted input comes from in .seccheck-task.txt at the repo root.
+ROOT=$(git rev-parse --show-toplevel)
+TASK="$ROOT/.seccheck-task.txt"
+[ -f "$TASK" ] || { echo "seccheck: no .seccheck-task.txt, skipping"; exit 0; }
+seccheck "$TASK" "$ROOT" || { echo "seccheck found security problems. Fix them or commit with --no-verify."; exit 1; }

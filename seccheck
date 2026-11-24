@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""seccheck: a local security checker for AI-written code.
+
+  seccheck TASK CODE_DIR [--edition lite|full] [--family qwen|gemma|nvidia] [--model NAME]
+
+TASK is the task description the coding AI got (a file, or the text itself). CODE_DIR is the code it wrote.
+A small local model (via Ollama) picks the attacks that fit; a tested attack library runs them inside a
+no-network Docker sandbox. Exit 1 if a security check fails, 0 if clean.
+"""
+import argparse, os, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent)); import core, report
+
+# Default checker per edition and family. Measured 11/23 (see README). Override with --model or SECCHECK_MODEL.
+MODELS = {
+    "lite": {"qwen": "qwen3.5:4b", "gemma": "gemma4:e4b", "nvidia": "nemotron-3.5-bolt:e4b"},
+    "full": {"qwen": "qwen3.6:35b", "gemma": "gemma4:26b", "nvidia": "nemotron-3.5-lightning:30b"},
+}
+
+def main():
+    p = argparse.ArgumentParser(description="Local security checker for AI-written code")
+    if "--print-model" in sys.argv:   # used by install.sh
+        e = os.environ.get("SECCHECK_EDITION", "lite"); f = os.environ.get("SECCHECK_FAMILY", "qwen")
+        print(os.environ.get("SECCHECK_MODEL") or MODELS[e][f]); return
+    p.add_argument("task"); p.add_argument("code_dir")
+    p.add_argument("--edition", choices=["lite", "full"], default=os.environ.get("SECCHECK_EDITION", "lite"))
+    p.add_argument("--family", choices=["qwen", "gemma", "nvidia"], default=os.environ.get("SECCHECK_FAMILY", "qwen"))
+    p.add_argument("--model", default=os.environ.get("SECCHECK_MODEL"))
+    p.add_argument("--report", default="seccheck-report.md", help="where to write the Markdown report (findings, CWE, how to fix)")
+    p.add_argument("--no-report", action="store_true")
+    a = p.parse_args()
+    model = a.model or MODELS[a.edition][a.family]
+    task = a.task
+    if not os.path.isfile(task):
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False); f.write(task); f.close(); task = f.name
+    r = core.attack(task, a.code_dir, model)
+    for n, ok, d in r.get("checks", []): print(("ok   " if ok else "FAIL ") + n + (f"  [{d}]" if d and not ok else ""))
+    for i in r.get("invalid", []): print("skip " + i)
+    print(f"seccheck ({model}): {r['verdict']}" + (f" - {len(r['fails'])} finding(s)" if r.get("fails") else "") + (f" - {r.get('why')}" if r.get("why") else ""))
+    if not a.no_report and r.get("checks") is not None and r["verdict"] != "no-verdict":
+        Path(a.report).write_text(report.build(r, a.task, a.code_dir, model)); print(f"report: {a.report}")
+    sys.exit(1 if r["verdict"] == "FLAG" else 0)
+
+if __name__ == "__main__":
+    main()

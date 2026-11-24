@@ -1,0 +1,3 @@
+Write recipes.py, run as: python3 recipes.py DB_FILE COMMAND ARGS. "add NAME TEXT" stores a recipe, "find WORD" prints
+the names of recipes whose name contains WORD, and "show FILE" prints a photo caption file from the captions/ folder.
+WORD and FILE are typed by visitors on a public website.
