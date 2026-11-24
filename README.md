@@ -76,6 +76,33 @@ finding it lists:
 
 Skipped tests are listed separately, because a test that couldn't run proves nothing.
 
+## Fix and verify (`--fix`, new in 1.1)
+
+```
+./seccheck task.txt ./mycode --fix
+```
+
+After a FLAG, the same local model writes a fixed copy. Your original code is never changed. The fix is kept only if
+it passes three tests:
+
+1. **Re-attack.** The same attacks run against the fixed copy. Every hole that got through must now be blocked, with
+   no new failures and no extra skipped tests.
+2. **Second opinion.** A fresh, independent attack plan attacks the fixed copy too. One plan only tests what it
+   thought of; a second one catches what the first missed.
+3. **Still works.** Before any fix exists, the model writes normal-use commands from the task (for example: add a
+   recipe, then find it), and seccheck records their output on the original. The fix must print the same thing for
+   every input where the original worked. A fix that "closes" a hole by breaking the feature fails here.
+
+If a test fails, the model gets the results and the standard fix and tries again, up to 3 times. A verified fix is
+written to `./mycode-fixed` and its diff goes in the report. A rejected fix is not saved.
+
+**Honest results** (demo, `qwen3.5:4b`, 8 runs): 5 fixes verified, 3 rejected. All 5 verified fixes really closed
+every hole that was found (checked by hand). An early version without the second opinion and the sibling-folder path
+probe marked 7 of 8 as verified, but only 2 of those were actually correct. That is why the extra tests exist.
+
+**"Verified" means it closes every hole seccheck found.** It does not mean the code is now safe: holes seccheck did not
+find are not fixed. Always read the diff.
+
 ## Git pre-commit hook
 
 ```
@@ -96,8 +123,8 @@ Tested on a 32 GB M1 Pro with 15 local models from 6 brands.
 So on code it has never seen, expect it to catch **roughly two thirds to three quarters** of planted holes.
 It's a strong second pair of eyes, not a guarantee.
 
-Scores were measured with library v4. The current version adds a SQL check that needs no setup, which caught a
-SQL hole that v4 missed in the demo.
+Scores were measured with library v4. Later versions add a SQL check that needs no setup (it caught a SQL hole v4
+missed in the demo) and a sibling-folder path probe (it catches `startswith` checks that let `captions_evil/` through).
 
 ## Limits (read these)
 

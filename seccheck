@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """seccheck: a local security checker for AI-written code.
 
-  seccheck TASK CODE_DIR [--edition lite|full] [--family qwen|gemma|nvidia] [--model NAME]
+  seccheck TASK CODE_DIR [--edition lite|full] [--family qwen|gemma|nvidia] [--model NAME] [--fix]
 
 TASK is the task description the coding AI got (a file, or the text itself). CODE_DIR is the code it wrote.
 A small local model (via Ollama) picks the attacks that fit; a tested attack library runs them inside a
 no-network Docker sandbox. Exit 1 if a security check fails, 0 if clean.
 """
-import argparse, os, sys, tempfile
+import argparse, os, shutil, sys, tempfile
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent)); import core, report
+sys.path.insert(0, str(Path(__file__).resolve().parent)); import core, report, fix
 
 # Default checker per edition and family. Measured 11/23 (see README). Override with --model or SECCHECK_MODEL.
 MODELS = {
@@ -28,6 +28,8 @@ def main():
     p.add_argument("--model", default=os.environ.get("SECCHECK_MODEL"))
     p.add_argument("--report", default="seccheck-report.md", help="where to write the Markdown report (findings, CWE, how to fix)")
     p.add_argument("--no-report", action="store_true")
+    p.add_argument("--fix", action="store_true", help="after a FLAG, write a fixed copy and keep it only if it passes re-attack + still-works tests")
+    p.add_argument("--fix-out", help="where to write a verified fix (default: CODE_DIR-fixed)")
     a = p.parse_args()
     model = a.model or MODELS[a.edition][a.family]
     task = a.task
@@ -37,8 +39,21 @@ def main():
     for n, ok, d in r.get("checks", []): print(("ok   " if ok else "FAIL ") + n + (f"  [{d}]" if d and not ok else ""))
     for i in r.get("invalid", []): print("skip " + i)
     print(f"seccheck ({model}): {r['verdict']}" + (f" - {len(r['fails'])} finding(s)" if r.get("fails") else "") + (f" - {r.get('why')}" if r.get("why") else ""))
+    fx = None
+    if a.fix and r["verdict"] == "FLAG":
+        fx = fix.run(task, a.code_dir, model, r)
+        if fx["status"].startswith("verified"):
+            dest = Path(a.fix_out or a.code_dir.rstrip("/") + "-fixed")
+            if dest.exists(): dest = Path(f"{dest}-{os.getpid()}")      # never overwrite anything
+            shutil.copytree(fx["dir"], dest); fx["out"] = str(dest)
+            print(f"fix: VERIFIED after {fx['tries']} tr{'y' if fx['tries'] == 1 else 'ies'}: every hole found is closed, "
+                  f"{fx['checks_passed']} checks passed, normal use unchanged ({fx['strength']} behavior tests). Written to {dest}")
+            if fx["status"] == "verified-attacks-only": print("fix: note: no normal-use test produced output, so behavior was NOT verified. Read the diff.")
+        else:
+            print("fix: REJECTED (not saved): " + "; ".join(fx["reasons"])[:400])
+        shutil.rmtree(Path(fx.get("dir", "/nonexistent")).parent, ignore_errors=True) if fx.get("dir") else None
     if not a.no_report and r.get("checks") is not None and r["verdict"] != "no-verdict":
-        Path(a.report).write_text(report.build(r, a.task, a.code_dir, model)); print(f"report: {a.report}")
+        Path(a.report).write_text(report.build(r, a.task, a.code_dir, model, fx)); print(f"report: {a.report}")
     sys.exit(1 if r["verdict"] == "FLAG" else 0)
 
 if __name__ == "__main__":

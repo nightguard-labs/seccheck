@@ -5,7 +5,7 @@ import datetime, json, re
 # (pattern in the check name, plan kind, title, CWE, OWASP Top 10 2021, standard fix)
 RULES = [
     (r"path escape .* reveal", "path", "Path traversal (read)", "CWE-22", "A01 Broken Access Control",
-     "Resolve the full path (os.path.realpath) and refuse it unless it starts with the allowed folder. Reject absolute paths and '..'. Don't follow symlinks out of the folder."),
+     "Resolve the real path and refuse anything outside the allowed folder. Compare whole folders, not text prefixes (startswith lets 'captions_evil/' through): base = os.path.realpath('captions'); full = os.path.realpath(os.path.join(base, name)); if os.path.commonpath([base, full]) != base: refuse."),
     (r"path escape .* write", "path", "Path traversal (write)", "CWE-22", "A01 Broken Access Control",
      "Same as above, before opening for writing. Build the target from a fixed folder plus a checked file name only."),
     (r"shell metacharacters", "shell", "OS command injection", "CWE-78", "A03 Injection",
@@ -13,7 +13,7 @@ RULES = [
     (r"quote in the input does not break the SQL", "sql", "SQL injection (query built from text)", "CWE-89", "A03 Injection",
      "Use parameterized queries: cursor.execute('... WHERE name LIKE ?', ('%' + word + '%',)). Never put user text into the SQL string with f-strings, + or %."),
     (r"SQL injection", "sql", "SQL injection (hidden rows exposed)", "CWE-89", "A03 Injection",
-     "Use parameterized queries (? placeholders). For LIKE searches also escape % and _ with an ESCAPE clause."),
+     "Use parameterized queries (? placeholders). For LIKE searches ALSO escape the wildcards, or a visitor typing % sees every row: word = word.replace('\\\\', '\\\\\\\\').replace('%', '\\\\%').replace('_', '\\\\_'); cursor.execute(\"... WHERE name LIKE ? ESCAPE '\\\\'\", ('%' + word + '%',))"),
     (r"secret input is not written", "leak", "Secret written to a file or log", "CWE-532", "A09 Security Logging and Monitoring Failures",
      "Never log or save passwords, keys, tokens or card numbers. Store only a salted hash (passwords) or a masked value (last 4 digits)."),
     (r"hostile .* file does not run code", "deserialize", "Unsafe deserialization", "CWE-502", "A08 Software and Data Integrity Failures",
@@ -45,7 +45,7 @@ def _rule(name):
     return None, "Security check failed", "", "", "Review the check named above."
 
 
-def build(r, task, code_dir, model):
+def build(r, task, code_dir, model, fx=None):
     fails = [(n, d) for n, ok, d in r.get("checks", []) if not ok]
     plan = {a.get("kind"): a for a in (r.get("plan") or {}).get("attacks", []) if isinstance(a, dict)}
     out = ["# seccheck report", "",
@@ -67,6 +67,17 @@ def build(r, task, code_dir, model):
         out += [f"**Fix:** {g['fix']}", ""]
     if r.get("invalid"):
         out += ["## Skipped (could not run, so NOT proof of safety)", ""] + [f"- {i}" for i in r["invalid"]] + [""]
+    if fx:
+        out += ["## Fix (seccheck --fix)", ""]
+        if fx["status"].startswith("verified"):
+            out += [f"**Status: VERIFIED** after {fx['tries']} attempt(s). Written to `{fx.get('out', '?')}`; your original was not changed.", "",
+                    f"- Re-attack with the same plan, plus a fresh second plan: {fx['checks_passed']} checks passed, none failed.",
+                    f"- Still works: {fx['strength']} normal-use test(s) give the same output as the original." if fx["strength"] else
+                    "- Still works: NOT verified (no normal-use test produced output). Read the diff carefully.",
+                    "- Verified means every hole seccheck found is closed. Holes it did not find are not fixed.", "",
+                    "```diff", fx.get("diff", "").rstrip(), "```", ""]
+        else:
+            out += [f"**Status: REJECTED** after {fx['tries']} attempt(s). No fix was saved.", "", "Why:", ""] + [f"- {w}" for w in fx["reasons"]] + [""]
     if not fails:
         out += ["No checks failed. That means none of the attacks that ran found a hole, not that the code is proven safe.", ""]
     return "\n".join(out)

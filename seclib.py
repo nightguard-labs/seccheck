@@ -17,6 +17,7 @@ Everything here is generic (no knowledge of any particular task):
   + always    (static) hard-coded secrets / API keys in the source
 
 usage (inside the sandbox): python3 seclib.py PLAN.json CODE_DIR  -> prints one JSON line: SECLIB-RESULT {...}
+                            python3 seclib.py PLAN.json CODE_DIR --smoke  -> harmless-input outputs: SECLIB-SMOKE [...]
 """
 import json, os, re, shutil, subprocess, sys, tempfile, time, zipfile, pickle, base64
 
@@ -110,6 +111,18 @@ def k_path(a, code_dir):
         written = [f for f in os.listdir(out) if f != "secret.txt"] + sorted(set(os.listdir(root)) - before)   # 11/23 v4
         if open(os.path.join(out, "secret.txt")).read() != CANARY + "\n": written.append("secret.txt (overwritten)")
         rec(f"sec: path escape ({label}) does not write a file outside the folder", not written, f"{written}" if written else "")
+    # 11/23 v1.1: sibling-prefix bypass. A check like realpath(p).startswith(realpath("captions")) with no trailing
+    # separator lets "captions_x/" through. Probe each sub-folder the source names: put a secret in NAME_seccheck/ beside it.
+    src = "\n".join(source(code_dir).values())
+    for sub in sorted(x for x in os.listdir(code_dir) if os.path.isdir(os.path.join(code_dir, x)) and not x.startswith(".")):
+        if not re.search(r"[\"']" + re.escape(sub) + r"[/\"']", src): continue
+        d, out = fresh(code_dir)
+        sib = os.path.join(d, sub + "_seccheck"); os.makedirs(sib)
+        with open(os.path.join(sib, "secret.txt"), "w") as f: f.write(CANARY + "\n")
+        subs = {"DIR": d, "CANARY": CANARY, "PAYLOAD": f"../{sub}_seccheck/secret.txt"}
+        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs))
+        if broken(rc, se): INVALID.append(f"path/sibling: {se[-120:]}"); continue
+        rec(f"sec: path escape (sibling-prefix {sub}_x/) does not reveal a file outside the folder", CANARY not in so + se)
 
 
 def k_shell(a, code_dir):
@@ -318,8 +331,29 @@ KINDS = {"path": k_path, "shell": k_shell, "sql": k_sql, "leak": k_leak, "deseri
          "redos": k_redos, "html": k_html, "redirect": k_redirect, "archive": k_zip, "tar": k_zip,
          "code": k_code, "eval": k_code, "env": k_env}
 
+def smoke(plan, code_dir):
+    """v1.1 'still works' check: run every plan command with HARMLESS input only and record what it prints.
+    seccheck runs this on the original and on a proposed fix; a fix must give the same answers."""
+    names = []
+    for root, _, fs in os.walk(code_dir):
+        for f in sorted(fs):
+            rel = os.path.relpath(os.path.join(root, f), code_dir)
+            if os.sep in rel: names += [f, rel]                  # real files in sub-folders = normal path inputs
+    outs = []
+    for i, a in enumerate(plan.get("attacks", []) if isinstance(plan, dict) else []):
+        if not isinstance(a, dict) or not isinstance(a.get("cmd"), list): continue
+        vals = ["sample"] if a.get("kind") == "usage" else ["sample", "a"] + (names[:4] if a.get("kind") == "path" else [])
+        for v in vals:
+            try: rc, so, se, _, d, out = attempt(a, code_dir, v)
+            except SetupFailed: outs.append([i, a.get("kind"), v, "setup-failed", ""]); continue
+            except Exception as e: outs.append([i, a.get("kind"), v, "error " + type(e).__name__, ""]); continue
+            outs.append([i, a.get("kind"), v, rc == 0, so.replace(d, "{DIR}").replace(out, "{OUT}")[:2000]])
+    print("SECLIB-SMOKE " + json.dumps(outs))
+
+
 if __name__ == "__main__":
     plan, code_dir = json.load(open(sys.argv[1])), sys.argv[2]
+    if sys.argv[3:] == ["--smoke"]: smoke(plan, code_dir); sys.exit(0)
     attacks = plan.get("attacks", []) if isinstance(plan, dict) else []
     kinds = {a.get("kind") for a in attacks if isinstance(a, dict)}
     s_secrets(code_dir)

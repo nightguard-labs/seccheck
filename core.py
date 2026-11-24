@@ -113,6 +113,32 @@ def problems(plan):
     return out
 
 
+def sandbox(plan, code_dir, extra=()):
+    """Run the attack library on a copy of code_dir inside the locked-down container. Returns (stdout, stderr)."""
+    g = Path(tempfile.mkdtemp(prefix="seccheck-", dir="/private/tmp" if sys.platform == "darwin" else None))  # Docker Desktop shares /private/tmp on macOS
+    shutil.copytree(code_dir, g / "code"); shutil.copy(LIB, g / "seclib.py")
+    (g / "plan.json").write_text(json.dumps(plan))
+    subprocess.run(["chmod", "-R", "a+rwX", str(g)])
+    try:
+        p = subprocess.run(["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                            "--memory", "512m", "--pids-limit", "128", "--user", "65534:65534", "-e", "HOME=/tmp",
+                            "-v", f"{g}:/g:ro", "-w", "/tmp", os.environ.get("SECCHECK_IMAGE", "seccheck-sandbox:1"),
+                            "python3", "/g/seclib.py", "/g/plan.json", "/g/code", *extra],
+                           capture_output=True, text=True, timeout=600)
+        out, err = p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        out, err = "", "timeout"
+    shutil.rmtree(g, ignore_errors=True)
+    return out, err
+
+
+def smoke(plan, code_dir):
+    """Harmless-input outputs of every plan command (the 'still works' fingerprint), or None if it could not run."""
+    out, _ = sandbox(plan, code_dir, ("--smoke",))
+    line = [l for l in out.splitlines() if l.startswith("SECLIB-SMOKE ")]
+    return json.loads(line[-1][13:]) if line else None
+
+
 def attack(task_file, code_dir, model, plan=None):
     retried = False
     if plan is None:
@@ -125,20 +151,7 @@ def attack(task_file, code_dir, model, plan=None):
             plan2 = parse_plan(reply2)
             if isinstance(plan2, dict) and (not problems(plan2) or len(problems(plan2)) < len(errs)): plan, reply = plan2, reply2
         if not isinstance(plan, dict): return {"verdict": "no-verdict", "why": "no plan in reply", "checks": [], "reply": reply[-500:], "retried": retried}
-    g = Path(tempfile.mkdtemp(prefix="seccheck-", dir="/private/tmp" if sys.platform == "darwin" else None))  # Docker Desktop shares /private/tmp on macOS
-    shutil.copytree(code_dir, g / "code"); shutil.copy(LIB, g / "seclib.py")
-    (g / "plan.json").write_text(json.dumps(plan))
-    subprocess.run(["chmod", "-R", "a+rwX", str(g)])
-    try:
-        p = subprocess.run(["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                            "--memory", "512m", "--pids-limit", "128", "--user", "65534:65534", "-e", "HOME=/tmp",
-                            "-v", f"{g}:/g:ro", "-w", "/tmp", os.environ.get("SECCHECK_IMAGE", "seccheck-sandbox:1"),
-                            "python3", "/g/seclib.py", "/g/plan.json", "/g/code"],
-                           capture_output=True, text=True, timeout=600)
-        out, err = p.stdout, p.stderr
-    except subprocess.TimeoutExpired:
-        out, err = "", "timeout"
-    shutil.rmtree(g, ignore_errors=True)
+    out, err = sandbox(plan, code_dir)
     line = [l for l in out.splitlines() if l.startswith("SECLIB-RESULT ")]
     if not line: return {"verdict": "no-verdict", "why": "library crashed: " + err[-200:], "checks": [], "plan": plan}
     res = json.loads(line[-1][14:])
