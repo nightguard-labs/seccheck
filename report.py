@@ -67,6 +67,8 @@ def build(r, task, code_dir, model, fx=None):
             out += ["**How it was attacked** (the library swaps `{PAYLOAD}` for the hostile values above):", "",
                     "```", " ".join(json.dumps(x) if " " in x else x for x in a["cmd"]), "```", ""]
         out += [f"**Fix:** {g['fix']}", ""]
+    if r.get("notes"):
+        out += ["## Notes", ""] + [f"- {i}" for i in r["notes"]] + [""]
     if r.get("invalid"):
         out += ["## Skipped (could not run, so NOT proof of safety)", ""] + [f"- {i}" for i in r["invalid"]] + [""]
     if fx:

@@ -56,7 +56,12 @@ Reply with ONLY a JSON object. Example for made-up programs (NOT this task):
   {{"kind": "html", "files": {{"posts.json": "[{{\\"title\\": \\"{{PAYLOAD}}\\", \\"link\\": \\"{{URL_PAYLOAD}}\\"}}]"}},
     "cmd": ["python3", "blog.py", "{{DIR}}/posts.json"]}},
   {{"kind": "code", "files": {{"calc.json": "{{\\"formula\\": \\"{{PAYLOAD}}\\"}}"}}, "cmd": ["python3", "calc.py", "{{DIR}}/calc.json", "formula"]}},
+  {{"kind": "sql", "cmd": ["python3", "shop.py", "{{PAYLOAD}}"]}},
+  {{"kind": "shell", "cmd": ["python3", "pinger.py"], "stdin": "{{\"host\": \"{{PAYLOAD}}\"}}"}},
+  {{"kind": "sql", "files": {{"upload.csv": "name,price\\n{{PAYLOAD}},1\\n"}}, "cmd": ["python3", "importer.py", "{{DIR}}/t.db", "{{DIR}}/upload.csv"]}},
+  {{"kind": "html", "files": {{"settings.ini": "[page]\\ntitle = {{PAYLOAD}}\\n"}}, "cmd": ["python3", "report.py", "{{DIR}}/settings.ini"]}},
   {{"kind": "env", "cmd": ["python3", "greet.py", "{{PAYLOAD}}"]}},
+  {{"kind": "shell", "cmd": ["python3", "visit.py"], "env": {{"VISITOR_NAME": "{{PAYLOAD}}"}}}},
   {{"kind": "token"}}
 ]}}"""
 
@@ -125,12 +130,16 @@ def problems(plan):
     out = []
     for a in plan["attacks"]:
         if not isinstance(a, dict): out.append("every attack must be a JSON object"); continue
-        k = a.get("kind"); body = json.dumps({x: a.get(x) for x in ("cmd", "stdin", "files")})
+        k = a.get("kind"); body = json.dumps({x: a.get(x) for x in ("cmd", "stdin", "files", "env")})
         if k in NEED and "{" + NEED[k] + "}" not in body and not (k == "leak" and "{PAYLOAD}" in body):
             out.append(f"the {k} attack never passes {{{NEED[k]}}} to the program; put the placeholder exactly where the untrusted value goes, don't write your own attack strings")
         if k == "sql" and "{CANARY}" in json.dumps([a.get("cmd"), a.get("stdin")]):
             out.append("in the sql attack, {CANARY} goes ONLY in setup (store it as a hidden row); the attack cmd uses {PAYLOAD} where a visitor's text goes")
         if k in NEED and not isinstance(a.get("cmd"), list): out.append(f"the {k} attack needs \"cmd\" as a list of strings")
+        if isinstance(a.get("files"), dict) and any(str(f).endswith((".py", ".sh", ".js")) for f in a["files"]):
+            out.append("never put the program's own code in \"files\": seccheck tests the code exactly as written; \"files\" is only for INPUT files (data, uploads, settings) the program reads")
+        if isinstance(a.get("cmd"), list) and any(isinstance(x, str) and (" | " in x or x.startswith("echo ")) for x in a["cmd"]):
+            out.append("don't write shell pipelines like echo ... | python3 in \"cmd\": cmd is just the program and its arguments, and text the program reads from standard input goes in the \"stdin\" field")
         for bad in sorted(set(re.findall(r"\{([A-Z_]+)\}", json.dumps(a))) - {"DIR", "PAYLOAD", "CANARY", "ARCHIVE", "FILE", "OUT"}):
             out.append(f"{{{bad}}} is not a placeholder seccheck knows; use exactly {{{NEED.get(k, 'PAYLOAD')}}}")
         if k == "deserialize" and a.get("call") and not re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+", str(a["call"])):
@@ -198,6 +207,45 @@ def leak_out_of_scope(plan, task_file, code_dir):
     return ["leak: neither the task nor the code handles a secret (password, token, key, card), so saving the input is the program's job, not a leak"]
 
 
+STATIC = ("sec: no hard-coded secret", "sec: no regex with nested repetition", "sec: security tokens come from")
+
+
+def dynamic(res):
+    """11/24: how many checks actually RAN the program (not just scanned its source)."""
+    return sum(1 for n, _, _ in (res or {}).get("checks", []) if not n.startswith(STATIC))
+
+
+USAGE_KINDS = ("shell", "path", "sql", "redos", "code", "html", "redirect", "env")
+INPUT_MISS = ("never read the stdin", "never read the argument", "plan never passes {PAYLOAD}", "never read the file")
+
+
+def usage_fallback(task, code_dir, res):
+    """11/24: attacks built from the task's usage line, one per UPPERCASE argument (the untrusted-value slots)."""
+    kinds = []
+    for i in res["invalid"]:
+        k = i.split(":")[0].split("/")[0].strip()
+        if k in USAGE_KINDS and any(m in i for m in INPUT_MISS) and k not in kinds: kinds.append(k)
+    if not kinds: return res
+    attacks = []
+    for m in re.finditer(r"python3\s+(\S+\.py)((?:\s+(?!and\b|\()[^\s.,;()]+)*)", task):
+        prog, args = m.group(1), m.group(2).split()
+        if not (Path(code_dir) / prog).exists(): continue
+        slots = [j for j, t in enumerate(args) if re.fullmatch(r"[A-Z][A-Z0-9_]*", t) and t not in ("DB",)]
+        if not slots or any("." in t for t in args): continue   # file arguments need real files: leave those to the model
+        for j in slots[:3]:
+            cmd = ["python3", prog] + [("{PAYLOAD}" if q == j else ("sample" if q in slots else t)) for q, t in enumerate(args)]
+            attacks += [{"kind": k, "cmd": cmd} for k in kinds]
+    if not attacks: return res
+    res2 = run_plan({"attacks": attacks[:12]}, code_dir)
+    if not res2 or dynamic(res2) == 0: return res
+    ran = set(res2.get("kinds") or [])
+    keep = [i for i in res["invalid"] if not (i.split(":")[0].split("/")[0].strip() in ran and any(m in i for m in INPUT_MISS))]
+    have = {n for n, _, _ in res["checks"]}
+    return dict(res, checks=res["checks"] + [c for c in res2["checks"] if c[0] not in have],
+                invalid=keep, notes=(res.get("notes") or []) + [f"{', '.join(sorted(ran))} attacks were rebuilt by seccheck from the task's usage line (the model's plan never reached the input)"],
+                kinds=sorted(set(res.get("kinds") or []) | ran))
+
+
 def attack(task_file, code_dir, model, plan=None):
     retried = False; model_made = plan is None; prompt = None
     if plan is None:
@@ -221,10 +269,18 @@ def attack(task_file, code_dir, model, plan=None):
         plan3 = parse_plan(reply3)
         if isinstance(plan3, dict) and not problems(plan3):
             res3 = run_plan(plan3, code_dir)
-            if res3 and len(res3["invalid"]) < len(res["invalid"]): plan, res, retried = plan3, res3, True
+            # 11/24 fake pass #9: an EMPTY re-plan has zero skips and used to "win" -> clean with nothing tested.
+            # The re-plan must run at least as many real attacks as before.
+            if res3 and len(res3["invalid"]) < len(res["invalid"]) and dynamic(res3) >= max(1, dynamic(res)): plan, res, retried = plan3, res3, True
+    # 11/24: the 4B's most common miss: it sends the value on stdin (or nowhere) to a program that reads ARGUMENTS,
+    # and the re-plan doesn't fix it. Build those attacks ourselves from the "python3 x.py ARG ..." usage in the task.
+    if model_made and task_file and res["invalid"]:
+        res = usage_fallback(Path(task_file).read_text(), code_dir, res)
+    if dynamic(res) == 0 and not res["invalid"] and "token" not in (res.get("kinds") or []):   # a token check IS the test for an id maker
+        res["invalid"].append("no attack ran: only the source scans were done, so this says nothing about how the program handles input")
     fails = [n for n, ok, _ in res["checks"] if not ok]
     return {"verdict": "FLAG" if fails else ("clean" if res["checks"] else "no-verdict"), "fails": fails, "retried": retried,
-            "checks": res["checks"], "invalid": res["invalid"], "kinds": res["kinds"], "plan": plan}
+            "checks": res["checks"], "invalid": res["invalid"], "kinds": res["kinds"], "plan": plan, "notes": res.get("notes", [])}
 
 
 if __name__ == "__main__":
@@ -233,5 +289,6 @@ if __name__ == "__main__":
     r = attack(a[0], a[1], model)
     for n, ok, d in r.get("checks", []): print(("ok   " if ok else "FAIL ") + n + (f"  [{d}]" if d and not ok else ""))
     for i in r.get("invalid", []): print("skip " + i)
+    for i in r.get("notes", []): print("note " + i)
     print(f"seccheck2 ({model}): {r['verdict']}" + (f" - {len(r['fails'])} finding(s)" if r.get("fails") else "") + (f" - {r.get('why')}" if r.get("why") else ""))
     sys.exit(1 if r["verdict"] == "FLAG" else 0)

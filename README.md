@@ -137,6 +137,27 @@ missed in the demo) and a sibling-folder path probe (it catches `startswith` che
 - **Your code runs.** It runs inside the locked-down container, but don't point seccheck at code you wouldn't
   run in a sandbox at all.
 
+### Known limits found in testing
+
+These came out of 30+ rounds of testing on fresh programs written by a different model, about 40% of them
+known-safe. Most of them are the small checker model, not the attack library.
+
+- **Input style.** The 4B model sometimes sends the attack the wrong way: on standard input to a program that
+  reads arguments, or as plain text to a program that wants a JSON request. seccheck detects this and reports a
+  `skip` instead of a false "clean". When the task gives a `python3 app.py ARG` usage line, seccheck rebuilds
+  those attacks itself (shown as a `note`). Write that usage line in your task text.
+- **Uploaded files.** Programs that read an uploaded CSV, INI, archive or settings file are the hardest for the
+  small model to plan. Expect more skips there. A bigger checker model did not help much in our tests; a
+  clear task description did.
+- **Unknown subcommands that fail silently.** If a program prints nothing and exits normally for a subcommand
+  it doesn't know, a plan with the wrong subcommand can look clean. Name the real subcommands in your task.
+- **Text scans are hints, not proof.** The hard-coded-secret, token and ReDoS checks read the source. Whether
+  input really reaches dangerous code is decided by the live attacks.
+- **Fixes are not always found.** `--fix` gets rejected more often for context-specific holes (for example, a
+  value placed inside a `<script>` string). A rejected fix is never saved.
+- **Testing never finishes.** Each round of fresh programs found rarer problems than the one before, but not
+  zero. Treat a clean result as "no known hole found", and read the skips and notes.
+
 ## License
 
 MIT. Made by nightguard labs.

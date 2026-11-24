@@ -38,6 +38,7 @@ def main():
     r = core.attack(task, a.code_dir, model)
     for n, ok, d in r.get("checks", []): print(("ok   " if ok else "FAIL ") + n + (f"  [{d}]" if d and not ok else ""))
     for i in r.get("invalid", []): print("skip " + i)
+    for i in r.get("notes", []): print("note " + i)
     sk = len(r.get("invalid", []))
     print(f"seccheck ({model}): {r['verdict']}" + (f" - {len(r['fails'])} finding(s)" if r.get("fails") else "") + (f" - {r.get('why')}" if r.get("why") else "")
           + (f" ({sk} attack{'s' if sk != 1 else ''} could not run, so this is NOT proof of safety: see the skip lines)" if sk and r["verdict"] == "clean" else ""))

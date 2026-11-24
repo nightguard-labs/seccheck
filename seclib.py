@@ -20,6 +20,7 @@ usage (inside the sandbox): python3 seclib.py PLAN.json CODE_DIR  -> prints one 
                             python3 seclib.py PLAN.json CODE_DIR --smoke  -> harmless-input outputs: SECLIB-SMOKE [...]
 """
 import json, os, re, shutil, subprocess, sys, tempfile, time, zipfile, pickle, base64
+import html
 
 CANARY = "SECCHECK-CANARY-4f9b2"
 RESULTS = []          # (check name, passed, detail)
@@ -39,7 +40,13 @@ def fresh(code_dir):
     return d, out
 
 
+PLAN_ENV = {}      # 11/24: the current attack's "env" (e.g. {"VISITOR_NAME": "{PAYLOAD}"}): input that comes from environment variables
+LAST_SUBS = {}
+
+
 def fill(x, subs, json_escape=False):
+    global LAST_SUBS
+    if isinstance(x, list) and not json_escape: LAST_SUBS = dict(subs)
     if isinstance(x, list): return [fill(i, subs, json_escape) for i in x]
     if not isinstance(x, str): return x
     for k, v in subs.items():
@@ -47,8 +54,17 @@ def fill(x, subs, json_escape=False):
     return x
 
 
+def fill_in(a, subs):
+    """11/24: stdin that is a JSON request ({"q": "{PAYLOAD}"}) gets the value JSON-escaped, so a quote in the attack
+    value doesn't just break the JSON (the program would reject it before the vulnerable code ever runs)."""
+    t = a.get("stdin", "") or ""
+    return fill(t, subs, json_escape=isinstance(t, str) and t.lstrip()[:1] in ("{", "["))
+
+
 def run(cmd, cwd, stdin="", timeout=10, env=None):
     t = time.time()
+    if PLAN_ENV:
+        env = dict(env or os.environ, **{str(k): str(fill(str(v), LAST_SUBS)) for k, v in PLAN_ENV.items()})
     try:
         p = subprocess.run(cmd, cwd=cwd, input=stdin, capture_output=True, text=True, timeout=timeout, env=env)
         return p.returncode, p.stdout, p.stderr, time.time() - t
@@ -60,7 +76,7 @@ def run(cmd, cwd, stdin="", timeout=10, env=None):
 
 def broken(rc, err):
     """True when the COMMAND is wrong (script missing, import error), not the program refusing an attack."""
-    return rc == "nostart" or "can't open file" in err or "ModuleNotFoundError" in err or "SyntaxError" in err
+    return rc == "nostart" or "can't open file" in err or "ModuleNotFoundError" in err or ("SyntaxError" in err and 'File "<string>"' not in err)
 
 
 def prep(a, code_dir, extra=None):
@@ -88,18 +104,19 @@ def attempt(a, code_dir, payload, extra=None, timeout=10):
     for name, text in (a.get("files") or {}).items():           # payload may also go inside an input file
         if "{PAYLOAD}" in text:
             open(os.path.join(d, name), "w").write(fill(text, subs, json_escape=name.endswith(".json")))
-    rc, so, se, secs = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs), timeout)
+    rc, so, se, secs = run(fill(a["cmd"], subs), d, fill_in(a, subs), timeout)
     return rc, so, se, secs, d, out
 
 
 # ---------------- dynamic attacks ----------------
 
 def k_path(a, code_dir):
-    probes = [("dotdot", "../" * 10 + "{OUT}/secret.txt"), ("absolute", "{OUT}/secret.txt"), ("symlink", "seccheck_link.txt")]
+    probes = [("dotdot", "../" * 10 + "{OUT}/secret.txt"), ("absolute", "{OUT}/secret.txt"), ("symlink", "seccheck_link.txt"),
+              ("doubled-dotdot", "....//" * 10 + "{OUT}/secret.txt")]   # 11/24: beats name.replace('../', '') filters
     # 11/24: control run with a harmless name. Anything written outside even then is caused by the plan's OTHER
     # arguments (e.g. {DIR} passed as the owner's book name), not by the attack value, so it is not counted.
     d0, out0 = fresh(code_dir); root0 = os.path.dirname(d0); b0 = set(os.listdir(root0)) | {"outside"}
-    run(fill(a["cmd"], {"DIR": d0, "CANARY": CANARY, "PAYLOAD": "seccheckfile.txt"}), d0, fill(a.get("stdin", ""), {"DIR": d0, "CANARY": CANARY, "PAYLOAD": "seccheckfile.txt"}))
+    run(fill(a["cmd"], {"DIR": d0, "CANARY": CANARY, "PAYLOAD": "seccheckfile.txt"}), d0, fill_in(a, {"DIR": d0, "CANARY": CANARY, "PAYLOAD": "seccheckfile.txt"}))
     always = set(os.listdir(out0)) - {"secret.txt"} | (set(os.listdir(root0)) - b0)
     if always: INVALID.append(f"path write test: the program writes outside its folder even with a harmless value ({sorted(always)[:3]}), so the plan's other arguments are wrong; only reads were tested")
     for label, tmpl in probes:
@@ -108,14 +125,16 @@ def k_path(a, code_dir):
         for sub in [x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x))]:   # link inside subfolders too
             try: os.symlink(os.path.join(out, "secret.txt"), os.path.join(d, sub, "seccheck_link.txt"))
             except OSError: pass
-        payload = tmpl.replace("{OUT}", out.lstrip("/") if label == "dotdot" else out)
+        payload = tmpl.replace("{OUT}", out.lstrip("/") if label in ("dotdot", "doubled-dotdot") else out)
         subs = {"DIR": d, "CANARY": CANARY, "PAYLOAD": payload}
         root = os.path.dirname(d); before = set(os.listdir(root)) | {"outside"}
-        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs))
+        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill_in(a, subs))
         if broken(rc, se): INVALID.append(f"path/{label}: {se[-120:]}"); continue
         rec(f"sec: path escape ({label}) does not reveal a file outside the folder", CANARY not in so + se)
         written = [f for f in os.listdir(out) if f != "secret.txt"] + sorted(set(os.listdir(root)) - before)   # 11/23 v4
-        if open(os.path.join(out, "secret.txt")).read() != CANARY + "\n": written.append("secret.txt (overwritten)")
+        sp = os.path.join(out, "secret.txt")   # 11/24: a program that MOVES the outside file used to crash the check
+        if not os.path.exists(sp): written.append("secret.txt (moved or deleted)")
+        elif open(sp).read() != CANARY + "\n": written.append("secret.txt (overwritten)")
         if always: continue
         rec(f"sec: path escape ({label}) does not write a file outside the folder", not written, f"{written}" if written else "")
     # 11/23 v1.1: sibling-prefix bypass. A check like realpath(p).startswith(realpath("captions")) with no trailing
@@ -127,9 +146,12 @@ def k_path(a, code_dir):
         sib = os.path.join(d, sub + "_seccheck"); os.makedirs(sib)
         with open(os.path.join(sib, "secret.txt"), "w") as f: f.write(CANARY + "\n")
         subs = {"DIR": d, "CANARY": CANARY, "PAYLOAD": f"../{sub}_seccheck/secret.txt"}
-        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs))
+        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill_in(a, subs))
         if broken(rc, se): INVALID.append(f"path/sibling: {se[-120:]}"); continue
         rec(f"sec: path escape (sibling-prefix {sub}_x/) does not reveal a file outside the folder", CANARY not in so + se)
+        sp = os.path.join(sib, "secret.txt")   # 11/24: a delete/overwrite tool escapes the same way (backup cleaner)
+        changed = "deleted" if not os.path.exists(sp) else ("overwritten" if open(sp).read() != CANARY + "\n" else "")
+        rec(f"sec: path escape (sibling-prefix {sub}_x/) does not delete or change a file outside the folder", not changed, changed)
 
 
 def k_shell(a, code_dir):
@@ -139,6 +161,13 @@ def k_shell(a, code_dir):
         rc, so, se, _, d, _ = attempt(a, code_dir, tmpl.replace("{M}", mark))
         if broken(rc, se): INVALID.append(f"shell/{i}: {se[-120:]}"); continue
         rec(f"sec: shell metacharacters {tmpl.split('{')[0].strip() or tmpl[:2]!r} do not run a command", not os.path.exists(mark))
+    # 11/24: some programs crash on any '/' in the value (they first open a file with that name), so also try
+    # markers with no slash, created in the program's own folder
+    for i, tmpl in enumerate(["x; touch {M}", "$(touch {M})", "x && touch {M}"]):
+        mark = f"seccheck_pwn_rel{i}"
+        rc, so, se, _, d, _ = attempt(a, code_dir, tmpl.replace("{M}", mark))
+        if broken(rc, se): continue
+        rec(f"sec: shell metacharacters {tmpl.split('{')[0].strip() or tmpl[:2]!r} (no-slash marker) do not run a command", not os.path.exists(os.path.join(d, mark)))
 
 
 def k_sql(a, code_dir):
@@ -154,12 +183,15 @@ def k_sql(a, code_dir):
     try: rc0, base_out, se0, _, _, _ = attempt(a, code_dir, "zzqx9nomatch")  # 11/23: baseline = what a nonsense search returns
     except SetupFailed as e: INVALID.append(f"sql setup failed: {e}"); return
     if broken(rc0, se0): INVALID.append(f"sql baseline: {se0[-120:]}"); return
-    base = set(base_out.split())
+    P = lambda t: {w.strip("'\":,.;()[]{}") for w in t.split()} - {""}   # 11/24: words without stuck-on punctuation
+    base = P(base_out.replace("zzqx9nomatch", " "))
     for p in ["x' OR '1'='1", "x' OR 1=1 --", '" OR ""="', "x' UNION SELECT {COL} FROM {TABLE} --", "%"]:
         p = p.replace("{COL}", a.get("column", "email")).replace("{TABLE}", a.get("table", "users"))
         rc, so, se, _, d, _ = attempt(a, code_dir, p)
         if broken(rc, se): INVALID.append(f"sql: {se[-120:]}"); continue
-        extra = set(so.split()) - base - set(p.split())
+        echo_free = so.replace(p, " ").replace(html.escape(p), " ").replace(html.escape(p, quote=False), " ")   # 11/24: echoed attack text is not a row
+        extra = P(echo_free) - base - P(p)
+        if p == "%": extra = set()   # 11/24: '%' showing every PUBLIC row is normal search; only the hidden secret row counts
         rec(f"sec: SQL injection {p[:18]!r} does not return hidden/extra rows", CANARY not in so and not extra, " ".join(sorted(extra))[:80])
 
 
@@ -209,6 +241,7 @@ def unreached(a, cmd_filled, d, info, value="{PAYLOAD}"):
     files = [n for n, t in (a.get("files") or {}).items() if value in str(t)]
     if files: places.append(any(os.path.abspath(os.path.join(d, n)) in info["opened"] for n in files))
     if value in str(a.get("stdin", "")): places.append(info["stdin"])
+    if value in json.dumps(a.get("env") or {}): places.append(True)   # 11/24: env reads are not traced; give it the benefit
     if places and not any(places):
         where = " or ".join(w for w, on in (("argument", pos), ("file", files), ("stdin", value in str(a.get("stdin", "")))) if on)
         return f"the program never read the {where} holding the attack value; check how it really takes input (arguments, stdin or which file)"
@@ -221,7 +254,7 @@ def k_leak(a, code_dir):
     for r, _, fs in os.walk(d):
         for f in fs: before[os.path.join(r, f)] = open(os.path.join(r, f), "rb").read()
     cmd = fill(a["cmd"], subs)
-    rc, so, se, info = traced(cmd, d, fill(a.get("stdin", ""), subs))
+    rc, so, se, info = traced(cmd, d, fill_in(a, subs))
     if broken(rc, se): INVALID.append(f"leak: {se[-120:]}"); return
     why = unreached(a, cmd, d, info, "{CANARY}")
     if why: INVALID.append("leak: " + why.replace("attack value", "secret")); return
@@ -283,10 +316,14 @@ def _archive(a, code_dir, fmt):
     rc, so, se, _ = run(fill(a["cmd"], {"DIR": d, "ARCHIVE": z, "PAYLOAD": z, "DEST": dest}), d)
     if broken(rc, se): INVALID.append(f"{fmt}: {se[-120:]}"); return
     if rc not in (0, 1, 2) and fmt == "tar" and "zip" in se.lower(): return   # a zip-only tool rejecting a tar is fine
+    # 11/24: the REAL target is wherever the harmless entry ok/<tag>_fine.txt landed (programs often unpack into
+    # their own fixed folder, not the one the plan suggested). Files under that folder are fine.
+    fine = [os.path.join(r, f) for base in (d, os.path.dirname(d)) for r, _, fs in os.walk(base) for f in fs if f == f"{tag}_fine.txt"]
+    if fine: dest = os.path.dirname(os.path.dirname(fine[0]))
     escaped = []
     for base in (d, os.path.dirname(d), "/tmp"):
         for r, _, fs in os.walk(base):
-            if r.startswith(dest) or (base == "/tmp" and r != "/tmp"): continue
+            if r == dest or r.startswith(dest + os.sep) or (base == "/tmp" and r != "/tmp"): continue
             escaped += [os.path.join(r, f) for f in fs if f.startswith(tag) and "_fine" not in f]
     escaped += [os.path.join(r, f) for r, _, fs in os.walk(os.path.join(os.path.dirname(d), "outside")) for f in fs if f.startswith(tag)]
     rec(f"sec: {fmt} entries are not written outside the target folder", not escaped, f"{escaped}" if escaped else "")
@@ -302,11 +339,18 @@ def k_redos(a, code_dir):
         rec(f"sec: hostile long input ({label}) finishes within {limit:g}s", rc != "timeout" and secs <= limit, f"{secs:.1f}s")
 
 
-def _live(html):
-    """Live markup an attacker added: <script>, on*= handlers in a real tag, javascript: links (quoted values stripped)."""
-    if re.search(r"<\s*script", html, re.I): return "script tag"
+def _bare(tag): return re.sub(r'"[^"]*"|\'[^\']*\'', '""', tag)
+
+
+def _live(html, base=""):
+    """Live markup an attacker added: <script>, on*= handlers in a real tag, javascript: links (quoted values stripped).
+    11/24: tags the program prints on its own (seen in a HARMLESS run, compared with quoted values blanked) don't count:
+    a profile card's own <img alt="..."> is not an injected tag."""
+    known = {_bare(t) for t in re.findall(r"<[a-zA-Z][^>]*>", base)}
+    if len(re.findall(r"<\s*script", html, re.I)) > len(re.findall(r"<\s*script", base, re.I)): return "script tag"
     for tag in re.findall(r"<[a-zA-Z][^>]*>", html):
-        bare = re.sub(r'"[^"]*"|\'[^\']*\'', '""', tag)
+        bare = _bare(tag)
+        if bare in known: continue
         if re.search(r"\son\w+\s*=", bare, re.I): return "event handler"
         if re.search(r"<img\b|<iframe\b|<svg\b", tag, re.I): return "injected tag"
         if re.search(r"href\s*=\s*[\"']?\s*javascript:", tag, re.I): return "javascript link"
@@ -316,26 +360,62 @@ def _live(html):
 def k_html(a, code_dir):
     if "{PAYLOAD}" not in json.dumps({k: a.get(k) for k in ("cmd", "stdin", "files")}):   # 11/23: model's own payloads
         d, out, subs = prep(a, code_dir)
-        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs))
+        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill_in(a, subs))
         if broken(rc, se): INVALID.append(f"html: {se[-120:]}"); return
         bad = _live(so); rec("sec: the model's hostile text adds no live HTML", not bad, bad); return
+    try: base = attempt(a, code_dir, "seccheckhello", extra={"URL_PAYLOAD": "http://ok.example"})[1]   # 11/24: the program's own tags
+    except SetupFailed: base = ""
     for p, u in [("<script>alert(1)</script>", "http://ok.example"), ('"><img src=x onerror=alert(1)>', "http://ok.example"),
                  ("' onmouseover='alert(1)", "javascript:alert(1)"), ("Bob", 'http://x.example" onmouseover="alert(1)'),
                  ("<b onclick=alert(1)>hi</b>", "JaVaScRiPt:alert(1)")]:
         rc, so, se, _, d, _ = attempt(a, code_dir, p, extra={"URL_PAYLOAD": u})
         if broken(rc, se): INVALID.append(f"html: {se[-120:]}"); continue
-        bad = _live(so)
+        bad = _live(so, base)
         rec(f"sec: user text {p[:20]!r} / link {u[:20]!r} adds no live HTML", not bad, bad)
+    # 11/24: programs with several inputs: the model may have attacked only the escaped one. Try each other plain argument.
+    cmd = a.get("cmd") or []
+    for i in range(2, len(cmd)):
+        x = str(cmd[i])
+        if "{" in x or x.startswith("-") or x.endswith((".py", ".db", ".json", ".txt", ".csv", ".ini", ".yaml", ".yml")): continue
+        alt = dict(a, cmd=[("Bob" if "{PAYLOAD}" in str(c) and j != i else ("{PAYLOAD}" if j == i else c)) for j, c in enumerate(cmd)])
+        for p in ["<script>alert(1)</script>", '"><img src=x onerror=alert(1)>']:
+            rc, so, se, _, d, _ = attempt(alt, code_dir, p, extra={"URL_PAYLOAD": "http://ok.example"})
+            if broken(rc, se) or rc != 0: break
+            bad = _live(so, attempt(alt, code_dir, "seccheckhello", extra={"URL_PAYLOAD": "http://ok.example"})[1])
+            rec(f"sec: user text {p[:20]!r} in argument {i} adds no live HTML", not bad, bad)
+
+
+def code_domains(code_dir):
+    return sorted(set(re.findall(r"""['"/]([a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|org|net|io|dev|app|example))[/'"]""", "\n".join(source(code_dir).values()))))[:2]
 
 
 def k_redirect(a, code_dir):
     """11/23: a user-supplied 'next' link must never send people to another site."""
-    for p in ["https://evil.example/x", "//evil.example", "/\\evil.example", "\\\\evil.example", "http:evil.example", " //evil.example"]:
+    # 11/24: (a) domains named in the code give "contains mysite.com" checks a test: evil.example/?mysite.com
+    doms = code_domains(code_dir)
+    probes = ["https://evil.example/x", "//evil.example", "/\\evil.example", "\\\\evil.example", "http:evil.example", " //evil.example"]
+    probes += [x for dm in doms for x in (f"https://evil.example/?{dm}", f"https://{dm}.evil.example/")]
+    # (b) two controls: an ordinary on-site path and a plainly off-site link. If the program answers them differently,
+    # an attack answered like the on-site path was ALLOWED. If it answers both alike, compare the domain tricks with the
+    # plain off-site answer instead: a trick answered differently from a blocked link got special (allowed) treatment.
+    def shape(p):
+        rc, so, se, _, _, _ = attempt(a, code_dir, p)
+        return (rc, so.replace(p, "{LINK}").strip()) if p in so else None
+    # 11/24: the on-site control may need the program's own domain (programs that only allow https://shop.example/...)
+    home = next((h for h in (shape(x) for x in ["/seccheck-home"] + [f"https://{dm}/seccheck-home" for dm in doms]) if h), None)
+    if home is None:   # 11/24: a program that only takes full links: an ordinary full link is the on-site-like control
+        home = next((h for h in (shape(x) for x in ["https://seccheck.example/home", "https://seccheck.example"]) if h), None)
+    blocked = shape("https://evil.example/x")
+    for p in probes:
         rc, so, se, _, d, _ = attempt(a, code_dir, p)
         if broken(rc, se): INVALID.append(f"redirect: {se[-120:]}"); continue
         lines = [l.strip() for l in so.splitlines()]
         offsite = re.compile(r"^\s*(?:[a-zA-Z][\w+.-]*:|//|/\\|\\)")   # 11/23: a scheme, //host, /\host or \host leaves the site
-        rec(f"sec: link {p!r} does not redirect to another site", not any("evil.example" in l and offsite.match(l) for l in lines))
+        me = (rc, so.replace(p, "{LINK}").strip()) if p in so else None
+        why = ""
+        if me and home and blocked and home != blocked and me == home: why = "answered exactly like an on-site link"
+        elif me and home and blocked and home == blocked and p not in probes[:6] and me != blocked: why = "answered differently from a blocked off-site link"
+        rec(f"sec: link {p!r} does not redirect to another site", not (why or any("evil.example" in l and offsite.match(l) for l in lines)), why)
 
 
 def k_code(a, code_dir):
@@ -357,11 +437,12 @@ ENV_NAMES = ["API_KEY", "SECRET_KEY", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "S
 def k_env(a, code_dir):
     """11/23 v4: secrets live in environment variables; user input must not be able to print them."""
     env = dict(os.environ, **{n: CANARY for n in ENV_NAMES})
-    for p in ["$API_KEY", "${SECRET_KEY}", "%DB_PASSWORD%", "$AWS_SECRET_ACCESS_KEY", "{SECCHECK_SECRET}", "${env:API_KEY}", "{{API_KEY}}"]:
+    for p in ["$API_KEY", "${SECRET_KEY}", "%DB_PASSWORD%", "$AWS_SECRET_ACCESS_KEY", "{SECCHECK_SECRET}", "${env:API_KEY}", "{{API_KEY}}",
+              "API_KEY", "SECRET_KEY"]:   # 11/24: bare names, for programs that look up a key the user names
         d, out, subs = prep(a, code_dir); subs["PAYLOAD"] = p
         for name, text in (a.get("files") or {}).items():
             if "{PAYLOAD}" in text: open(os.path.join(d, name), "w").write(fill(text, subs, json_escape=name.endswith(".json")))
-        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs), env=env)
+        rc, so, se, _ = run(fill(a["cmd"], subs), d, fill_in(a, subs), env=env)
         if broken(rc, se): INVALID.append(f"env: {se[-120:]}"); continue
         rec(f"sec: input {p!r} does not reveal a secret environment variable", CANARY not in so + se)
 
@@ -388,14 +469,16 @@ def s_secrets(code_dir):
 
 def s_token(code_dir):
     src = "\n".join(source(code_dir).values())
-    weak = re.search(r"\brandom\.(?:choice|choices|randint|randrange|random|getrandbits|sample|shuffle)\b|\bfrom random import\b", src)
+    weak = re.search(r"\brandom\.(?:choice|choices|randint|randrange|random|getrandbits|sample|shuffle)\b|\bfrom random import\b|\buuid\.uuid1\b|\buuid1\(", src)   # 11/24: uuid1 = time + MAC address
     strong = re.search(r"\bsecrets\b|urandom|SystemRandom", src)
     rec("sec: security tokens come from a cryptographic random source", not (weak and not strong), weak.group(0) if weak and not strong else "")
 
 
 def s_loader(code_dir):
     src = "\n".join(source(code_dir).values())
-    m = re.search(r"\bpickle\.loads?\(|\bmarshal\.loads?\(|(?<![\w.])eval\(|(?<![\w.])exec\(|yaml\.load\((?![^)]*SafeLoader)|\bshelve\.open\(", src)
+    # 11/24: eval/exec dropped from this TEXT scan: a guarded eval (AST allowlist first) is safe and the live code and
+    # deserialize/eval attacks test it for real. pickle/marshal/unsafe yaml/shelve are unsafe on untrusted data, always.
+    m = re.search(r"\bpickle\.loads?\(|\bmarshal\.loads?\(|yaml\.load\((?![^)]*SafeLoader)|\bshelve\.open\(", src)
     rec("sec: untrusted files are not loaded with a code-running loader", not m, m.group(0) if m else "")
 
 
@@ -410,15 +493,40 @@ def control_broken(a, code_dir):
     kind = a["kind"]
     try: d, out, subs = prep(a, code_dir)
     except SetupFailed as e: return f"setup failed: {e}"
-    subs["PAYLOAD"] = HARMLESS.get(kind, "sample")
-    for name, text in (a.get("files") or {}).items():
-        if "{PAYLOAD}" in text: open(os.path.join(d, name), "w").write(fill(text, subs, json_escape=name.endswith(".json")))
-    cmd = fill(a["cmd"], subs); stdin = fill(a.get("stdin", ""), subs)
-    rc, so, se, info = traced(cmd, d, stdin)
+    # 11/24: code input may need a specific shape (a settings loader wants a dict), so try a few harmless shapes
+    tries = (["1+1", "{'a': 1}", "[1, 2]", "'hello'"] if kind == "code"
+             else ["/seccheck-home", "https://seccheck.example/home", "https://seccheck.example"] + [f"https://{dm}/seccheck-home" for dm in code_domains(code_dir)] if kind == "redirect"   # 11/24: some only take full links / own domain
+             else [HARMLESS.get(kind, "sample")])
+    for k, val in enumerate(tries):
+        subs["PAYLOAD"] = val
+        for name, text in (a.get("files") or {}).items():
+            if "{PAYLOAD}" in text: open(os.path.join(d, name), "w").write(fill(text, subs, json_escape=name.endswith(".json")))
+        cmd = fill(a["cmd"], subs); stdin = fill_in(a, subs)
+        r = traced(cmd, d, stdin)
+        if k == 0: first = r
+        if r[0] == 0 and (kind not in ("html", "redirect") or val in r[1]): break
+    else: r = first; subs["PAYLOAD"] = tries[0]
+    rc, so, se, info = r
     if kind in HARMLESS and rc not in (0, "timeout") and "Traceback (most recent call last)" in se:
         return (se.strip().splitlines() or ["?"])[-1][:100]
     why = unreached(a, cmd, d, info)
     if why: return why
+    # 11/24: a program that gives the SAME error answer for two different harmless values never got the input
+    # (e.g. it wants a JSON request and the plan sent plain text: "Invalid JSON input." every time, exit 0)
+    if kind in ("shell", "path", "sql", "code", "env"):   # 11/24: not redos: a validator answering "Invalid" to both IS its job
+        subs2 = dict(subs, PAYLOAD=subs["PAYLOAD"] + "2" if kind != "code" else subs["PAYLOAD"] + "+0")
+        try: d2, _, _ = prep(a, code_dir)
+        except SetupFailed: d2 = None
+        if d2:
+            for name, text in (a.get("files") or {}).items():
+                if "{PAYLOAD}" in text: open(os.path.join(d2, name), "w").write(fill(text, subs2, json_escape=name.endswith(".json")))
+            rc2, so2, se2, _ = run(fill(a["cmd"], dict(subs2, DIR=d2)), d2, fill_in(a, dict(subs2, DIR=d2)))
+            same = (rc2, so2.replace(d2, "{D}"), se2.replace(d2, "{D}")) == (rc, so.replace(d, "{D}"), se.replace(d, "{D}"))
+            errorish = re.search(r"invalid|usage|missing|must be|expected|unknown (?:command|action|option)|bad request|json|decode|malformed|format", (so + se), re.I)
+            short_err = re.fullmatch(r"\W*(?:error|failed|fail)\W*", (so + se).strip(), re.I)   # ONLY a bare "Error" (not "Error: File not found")
+            verdict_word = re.fullmatch(r"\W*(?:in)?valid\W*", (so + se).strip(), re.I)   # a plain Valid/Invalid answer
+            if same and (errorish or short_err) and not verdict_word and subs["PAYLOAD"] not in so + se:
+                return f"the program gives the same error for every input with this plan ({((so or se).strip().splitlines() or ['?'])[0][:70]}); is the input format right (JSON, a field name, a subcommand)?"
     # 11/23: for output-based attacks the harmless run must WORK, or 'no bad output' proves nothing
     if kind in ("html", "redirect", "code") and rc != 0:
         return f"the program rejects even harmless input with this plan (exit {rc}: {((se or so).strip().splitlines() or ['?'])[-1][:70]}); is the input format right?"
@@ -438,8 +546,11 @@ def s_redos(code_dir):
     repeats, like ^([a-z]+\\s?)+$, can take exponential time on a long hostile input."""
     hits = []
     for f, txt in source(code_dir).items():
-        for lit in re.findall(r"""re\.(?:compile|match|search|fullmatch|findall|finditer|sub|split)\(\s*[rbuRBU]*(['"])(.*?)\1""", txt):
-            if NESTED.search(lit[1]): hits.append(f"{f}: {lit[1][:40]}")
+        lits = re.findall(r"""re\.(?:compile|match|search|fullmatch|findall|finditer|sub|split)\(\s*[rbuRBU]*(['"])(.*?)\1""", txt)
+        if re.search(r"^\s*(?:import re\b|from re import)", txt, re.M):   # 11/24: also patterns stored in a variable first
+            lits += re.findall(r"""(?<![\w])[rR]?(['"])((?:\\.|(?!\1).)*?)\1""", txt)
+        for lit in dict.fromkeys(l[1] for l in lits):
+            if NESTED.search(lit): hits.append(f"{f}: {lit[:40]}")
     rec("sec: no regex with nested repetition (ReDoS risk)", not hits, "; ".join(hits))
 
 
@@ -475,7 +586,7 @@ if __name__ == "__main__":
     kinds = {a.get("kind") for a in attacks if isinstance(a, dict)}
     s_secrets(code_dir)
     s_redos(code_dir)
-    if "token" in kinds: s_token(code_dir)
+    if "token" in kinds or re.search(r"token|reset|otp|passw|session|verif|\bcode\b|nonce", "\n".join(source(code_dir).values()), re.I): s_token(code_dir)   # 11/24
     if "deserialize" in kinds: s_loader(code_dir)
     NEED = {"path": "PAYLOAD", "shell": "PAYLOAD", "sql": "PAYLOAD", "redos": "PAYLOAD", "leak": "CANARY", "redirect": "PAYLOAD",
             "zip": "ARCHIVE", "archive": "ARCHIVE", "tar": "ARCHIVE", "code": "PAYLOAD", "eval": "PAYLOAD", "env": "PAYLOAD"}   # 11/23: the hostile value must actually reach the program
@@ -484,11 +595,20 @@ if __name__ == "__main__":
         if a["kind"] == "leak":   # 11/23 fix: {PAYLOAD} is the secret ONLY if the plan has no {CANARY}; otherwise it's an ordinary value
             j = json.dumps(a); a = json.loads(j.replace("{PAYLOAD}", "user1" if "{CANARY}" in j else "{CANARY}"))
         if a["kind"] in ("zip", "archive", "tar"): a = json.loads(json.dumps(a).replace("{PAYLOAD}", "{ARCHIVE}"))
-        need = NEED.get(a["kind"]); body = json.dumps({k: a.get(k) for k in ("cmd", "stdin", "files")})
+        # 11/24: a plan must NEVER replace the code under test. The 4B once rewrote safe_math.py with eval() via
+        # "files" and then "found" code injection in its own rewrite (false alarm). Drop such entries.
+        if isinstance(a.get("files"), dict):
+            own = {os.path.normpath(n) for n in source(code_dir)}   # code files only; data files (links.json, ...) are fair input
+            bad = [n for n in a["files"] if os.path.normpath(str(n)) in own or str(n).endswith((".py", ".sh", ".js", ".rb", ".go", ".swift"))]
+            if bad:
+                INVALID.append(f"{a['kind']}: the plan tried to overwrite the program's own file(s) {bad}; ignored (seccheck never changes the code it tests)")
+                a = dict(a, files={k: v for k, v in a["files"].items() if k not in bad})
+        need = NEED.get(a["kind"]); body = json.dumps({k: a.get(k) for k in ("cmd", "stdin", "files", "env")})
+        PLAN_ENV.clear(); PLAN_ENV.update(a.get("env") if isinstance(a.get("env"), dict) else {})
         if need and "{" + need + "}" not in body:
             INVALID.append(f"{a['kind']}: plan never passes {{{need}}} to the program"); continue
-        if a["kind"] == "sql" and not (a.get("setup") or a.get("files")):
-            INVALID.append("sql: no rows were stored first (setup)"); continue
+        # 11/24: no setup is OK now: the quote probe needs none, and k_sql reports the rows test as a skip itself
+        # (programs that seed their own rows were being skipped entirely)
         if a["kind"] != "deserialize" and not isinstance(a.get("cmd"), list) and a["kind"] != "token":
             INVALID.append(f"{a.get('kind')}: no cmd list"); continue
         if a["kind"] in ("html", "redirect", "code", "env", "shell", "redos", "path", "sql") and isinstance(a.get("cmd"), list):
