@@ -5,6 +5,8 @@
 Coding AIs write working code that quietly contains security holes: SQL injection, path traversal, secrets in logs.
 seccheck doesn't just read the code. It **attacks it**, inside a locked-down container, and tells you what broke.
 
+![seccheck finding SQL injection and path traversal in the demo, then passing the fixed version](docs/seccheck-demo.gif)
+
 ```
 $ ./seccheck demo/task.txt demo
 FAIL sec: a quote in the input does not break the SQL query (no query built from text)  [OperationalError]
