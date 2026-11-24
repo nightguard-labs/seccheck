@@ -102,6 +102,10 @@ def problems(plan):
         if k in NEED and "{" + NEED[k] + "}" not in body and not (k == "leak" and "{PAYLOAD}" in body):
             out.append(f"the {k} attack never passes {{{NEED[k]}}} to the program; put the placeholder exactly where the untrusted value goes, don't write your own attack strings")
         if k in NEED and not isinstance(a.get("cmd"), list): out.append(f"the {k} attack needs \"cmd\" as a list of strings")
+        for bad in sorted(set(re.findall(r"\{([A-Z_]+)\}", json.dumps(a))) - {"DIR", "PAYLOAD", "CANARY", "ARCHIVE", "FILE", "OUT"}):
+            out.append(f"{{{bad}}} is not a placeholder seccheck knows; use exactly {{{NEED.get(k, 'PAYLOAD')}}}")
+        if k == "deserialize" and a.get("call") and not re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+", str(a["call"])):
+            out.append(f"\"call\" must be just module.function (like \"settings.load_settings\"), not code like {a['call']!r}; or give \"cmd\" with {{FILE}}")
         if k == "sql":
             st = a.get("setup")
             if not st or not isinstance(st, list) or not all(isinstance(c, list) for c in st):

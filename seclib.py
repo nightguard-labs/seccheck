@@ -152,13 +152,43 @@ def k_sql(a, code_dir):
         rec(f"sec: SQL injection {p[:18]!r} does not return hidden/extra rows", CANARY not in so and not extra, " ".join(sorted(extra))[:80])
 
 
+TRACE_SITE = """import sys, os, atexit
+class _A(list):
+    seen = set()
+    def __getitem__(s, i):
+        if isinstance(i, slice): _A.seen.update(range(*i.indices(len(s))))
+        elif isinstance(i, int): _A.seen.add(i if i >= 0 else len(s) + i)
+        return list.__getitem__(s, i)
+    def __iter__(s): _A.seen.update(range(len(s))); return list.__iter__(s)
+    def copy(s): _A.seen.update(range(len(s))); return list(s)
+sys.argv = _A(sys.argv)
+atexit.register(lambda: open(os.environ["SC_TRACE"], "w").write(",".join(map(str, sorted(_A.seen)))))
+"""
+
+
+def argv_reads(cmd, cwd, stdin):
+    """11/23 v1.1 reachability: run a python3 command and report which sys.argv positions the program read.
+    Returns (rc, out, err, read_positions or None if unknown)."""
+    t = tempfile.mkdtemp(prefix="sc-trace-"); open(os.path.join(t, "sitecustomize.py"), "w").write(TRACE_SITE)
+    log = os.path.join(t, "trace.txt"); env = dict(os.environ, PYTHONPATH=t, SC_TRACE=log)
+    rc, so, se, _ = run(cmd, cwd, stdin, env=env)
+    seen = {int(x) for x in open(log).read().split(",") if x} if os.path.exists(log) else None
+    return rc, so, se, seen
+
+
 def k_leak(a, code_dir):
     d, out, subs = prep(a, code_dir)
     before = {}
     for r, _, fs in os.walk(d):
         for f in fs: before[os.path.join(r, f)] = open(os.path.join(r, f), "rb").read()
-    rc, so, se, _ = run(fill(a["cmd"], subs), d, fill(a.get("stdin", ""), subs))
+    cmd = fill(a["cmd"], subs)
+    rc, so, se, seen = argv_reads(cmd, d, fill(a.get("stdin", ""), subs))
     if broken(rc, se): INVALID.append(f"leak: {se[-120:]}"); return
+    # 11/23: if the secret is a python3 argument the program never read, the test proved nothing (silent false pass)
+    if seen is not None and cmd and os.path.basename(cmd[0]).startswith("python") and CANARY not in fill(a.get("stdin", ""), subs):
+        pos = [i - 1 for i, x in enumerate(cmd) if CANARY in x and i >= 1]
+        if pos and not any(p in seen for p in pos):
+            INVALID.append("leak: the program never read the argument holding the secret (check the command matches the program's usage)"); return
     leaked = []
     for r, _, fs in os.walk(d):
         for f in fs:
@@ -181,12 +211,16 @@ def k_deserialize(a, code_dir):
         elif kind == "yaml": open(f, "w").write(f"!!python/object/apply:os.system ['touch {mark}']")
         else: open(f, "w").write(json.dumps({"__class__": "os.system", "py/reduce": [{"py/function": "os.system"}, {"py/tuple": [f"touch {mark}"]}]}))
         if a.get("call"):
+            if not re.fullmatch(r"[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+", a["call"]):
+                INVALID.append(f"deserialize: call must be module.function, got {a['call']!r}"); return
             mod, fn = a["call"].rsplit(".", 1)
             cmd = ["python3", "-c", f"import sys; sys.path.insert(0, '.'); import {mod} as m\ntry: m.{fn}({f!r})\nexcept Exception as e: print('raised', type(e).__name__)"]
         else:
             cmd = fill(a["cmd"], {"DIR": d, "FILE": f, "PAYLOAD": f})
         rc, so, se, _ = run(cmd, d)
         if broken(rc, se): INVALID.append(f"deserialize/{kind}: {se[-120:]}"); continue
+        if re.search(r"raised (ModuleNotFoundError|ImportError|AttributeError|NameError|SyntaxError|TypeError)\b", so) and not os.path.exists(mark):
+            INVALID.append(f"deserialize/{kind}: the call itself failed ({so.strip()[:60]}), so the file was never loaded"); continue
         rec(f"sec: hostile {kind} file does not run code when loaded", not os.path.exists(mark))
 
 
@@ -342,7 +376,8 @@ def smoke(plan, code_dir):
     outs = []
     for i, a in enumerate(plan.get("attacks", []) if isinstance(plan, dict) else []):
         if not isinstance(a, dict) or not isinstance(a.get("cmd"), list): continue
-        vals = ["sample"] if a.get("kind") == "usage" else ["sample", "a"] + (names[:4] if a.get("kind") == "path" else [])
+        normal = {"usage": ["sample"], "redirect": ["/home", "/account?tab=2"]}   # 11/23: realistic harmless input per kind
+        vals = normal.get(a.get("kind")) or ["sample", "a"] + (names[:4] if a.get("kind") == "path" else [])
         for v in vals:
             try: rc, so, se, _, d, out = attempt(a, code_dir, v)
             except SetupFailed: outs.append([i, a.get("kind"), v, "setup-failed", ""]); continue

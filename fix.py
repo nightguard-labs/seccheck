@@ -43,6 +43,8 @@ Reply with ONLY a JSON object:
 {{"setup": [["python3", "prog.py", "..."], ...], "checks": [["python3", "prog.py", "..."], ...]}}
 - setup: 2-4 commands that store ordinary data (if the program stores anything); otherwise [].
 - checks: 2-4 commands whose printed output shows the program works (find what was stored, show a real file).
+- Use only inputs an honest, normal user would give, following every rule in the TASK (for example, if the task says
+  users only go to pages on our own site, use paths like /home, never outside sites). Don't copy odd things the code allows.
 - Use {{DIR}} for a writable folder (e.g. a database path {{DIR}}/data.db). Only use files that really exist in CODE.
 - Every command is a list of strings."""
 

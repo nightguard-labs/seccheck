@@ -25,7 +25,7 @@ RULES = [
     (r"adds no live HTML", "html", "Cross-site scripting (XSS)", "CWE-79", "A03 Injection",
      "Escape user text with html.escape(text, quote=True) before putting it in HTML, and allow only http/https links."),
     (r"does not redirect to another site", "redirect", "Open redirect", "CWE-601", "A01 Broken Access Control",
-     "Only redirect to relative paths that start with a single '/', or to an allow-list of your own hosts. Reject //, \\ and scheme: links."),
+     "Only allow paths on your own site: strip spaces, then accept only if it starts with exactly one '/' and has no backslash or scheme: ok = url.startswith('/') and not url.startswith('//') and '\\\\' not in url and ':' not in url.split('?')[0]; otherwise redirect to '/'."),
     (r"is not run as code", "code", "Code injection", "CWE-94", "A03 Injection",
      "Never eval/exec user text. Use a real parser (ast.literal_eval for literals, a small expression parser for formulas)."),
     (r"environment variable", "env", "Secret exposed from environment variables", "CWE-526", "A01 Broken Access Control",

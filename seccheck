@@ -38,7 +38,9 @@ def main():
     r = core.attack(task, a.code_dir, model)
     for n, ok, d in r.get("checks", []): print(("ok   " if ok else "FAIL ") + n + (f"  [{d}]" if d and not ok else ""))
     for i in r.get("invalid", []): print("skip " + i)
-    print(f"seccheck ({model}): {r['verdict']}" + (f" - {len(r['fails'])} finding(s)" if r.get("fails") else "") + (f" - {r.get('why')}" if r.get("why") else ""))
+    sk = len(r.get("invalid", []))
+    print(f"seccheck ({model}): {r['verdict']}" + (f" - {len(r['fails'])} finding(s)" if r.get("fails") else "") + (f" - {r.get('why')}" if r.get("why") else "")
+          + (f" ({sk} attack{'s' if sk != 1 else ''} could not run, so this is NOT proof of safety: see the skip lines)" if sk and r["verdict"] == "clean" else ""))
     fx = None
     if a.fix and r["verdict"] == "FLAG":
         fx = fix.run(task, a.code_dir, model, r)
@@ -46,9 +48,10 @@ def main():
             dest = Path(a.fix_out or a.code_dir.rstrip("/") + "-fixed")
             if dest.exists(): dest = Path(f"{dest}-{os.getpid()}")      # never overwrite anything
             shutil.copytree(fx["dir"], dest); fx["out"] = str(dest)
+            use = (f"normal use unchanged ({fx['strength']} behavior test{'s' if fx['strength'] != 1 else ''})" if fx["strength"]
+                   else "normal use NOT checked (no normal-use test produced output), read the diff")
             print(f"fix: VERIFIED after {fx['tries']} tr{'y' if fx['tries'] == 1 else 'ies'}: every hole found is closed, "
-                  f"{fx['checks_passed']} checks passed, normal use unchanged ({fx['strength']} behavior tests). Written to {dest}")
-            if fx["status"] == "verified-attacks-only": print("fix: note: no normal-use test produced output, so behavior was NOT verified. Read the diff.")
+                  f"{fx['checks_passed']} checks passed, {use}. Written to {dest}")
         else:
             print("fix: REJECTED (not saved): " + "; ".join(fx["reasons"])[:400])
         shutil.rmtree(Path(fx.get("dir", "/nonexistent")).parent, ignore_errors=True) if fx.get("dir") else None
